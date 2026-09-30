@@ -9,6 +9,7 @@ import base64
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask
 
 # ── Dossier de base (utile pour le mode local) ─────────────────────────────
@@ -20,8 +21,11 @@ else:
 CONFIG_FILE = os.path.join(BASE_DIR, "config.txt")
 PSEUDOS_FILE = os.path.join(BASE_DIR, "pseudos.json")
 EVENTS_FILE = os.path.join(BASE_DIR, "events.json")
+TEAM_EVENTS_FILE = os.path.join(BASE_DIR, "team_events.json")
 
-# ── Token Discord : variable d'environnement (Render) ou config.txt (local) ─
+PARIS = ZoneInfo("Europe/Paris")
+
+# ── Token Discord : variable d'environnement ou config.txt (local) ─────────
 def load_token_from_config():
     if not os.path.exists(CONFIG_FILE):
         return None
@@ -39,12 +43,16 @@ TOKEN = os.environ.get("DISCORD_TOKEN") or load_token_from_config()
 if not TOKEN:
     print("=" * 50)
     print("ERREUR : aucun token Discord trouvé.")
-    print("Sur Render : ajoute la variable d'environnement DISCORD_TOKEN.")
-    print("En local   : mets TOKEN=ton_token dans config.txt")
+    print("Serveur : ajoute DISCORD_TOKEN dans le fichier .env")
+    print("En local : mets TOKEN=ton_token dans config.txt")
     print("=" * 50)
     sys.exit(1)
 
-# ── Stockage : GitHub (sur Render) ou fichiers locaux (en local) ───────────
+# Serveur Discord de la team : la commande /orga n'apparaît que là
+TEAM_GUILD_ID = os.environ.get("TEAM_GUILD_ID", "").strip()
+TEAM_GUILD = discord.Object(id=int(TEAM_GUILD_ID)) if TEAM_GUILD_ID else None
+
+# ── Stockage : GitHub ou fichiers locaux ───────────────────────────────────
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")            # ex : "Gaurage/Bot-EVA-data"
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
@@ -140,6 +148,12 @@ def load_events():
 def save_events():
     _save("events.json", EVENTS_FILE, events)
 
+def load_team_events():
+    return _load("team_events.json", TEAM_EVENTS_FILE)
+
+def save_team_events():
+    _save("team_events.json", TEAM_EVENTS_FILE, team_events)
+
 def purge_old_events():
     limite = datetime.now(timezone.utc) - timedelta(days=30)
     to_delete = [
@@ -152,9 +166,25 @@ def purge_old_events():
         print(f"🗑️ {len(to_delete)} event(s) purgé(s) (> 30 jours)")
         save_events()
 
+def purge_old_team_events():
+    limite = datetime.now(timezone.utc).timestamp() - 30 * 24 * 3600
+    to_delete = [mid for mid, e in team_events.items() if e.get("start_ts", 0) < limite]
+    for mid in to_delete:
+        del team_events[mid]
+    if to_delete:
+        print(f"🗑️ {len(to_delete)} session(s) team purgée(s) (> 30 jours)")
+        save_team_events()
+
 pseudos_eva = load_pseudos()
 events = load_events()
+team_events = load_team_events()
 
+def pseudo_de(user):
+    return pseudos_eva.get(str(user.id), user.display_name)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /match : event 4v4 (serveur EVA)
+# ═══════════════════════════════════════════════════════════════════════════
 POSITIONS = ["⚡ Rusher", "🛡️ Teneur de ligne"]
 
 def build_embed(titre, date, equipe1, equipe2, absents, annules):
@@ -175,7 +205,7 @@ def build_embed(titre, date, equipe1, equipe2, absents, annules):
         return "\n".join(lines)
 
     embed.add_field(name="🔵 Équipe 1", value=format_team(equipe1), inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="​", value="​", inline=True)
     embed.add_field(name="🔴 Équipe 2", value=format_team(equipe2), inline=True)
 
     if absents:
@@ -204,6 +234,12 @@ def retirer_joueur(event, user_id):
     if user_id in event["annules_ids"]:
         event["annules_ids"].remove(user_id)
         event["annules"] = [a for a in event["annules"] if a[0] != user_id]
+
+def event_id_from_message(message_id):
+    for eid, e in events.items():
+        if e.get("message_id") == message_id:
+            return eid
+    return None
 
 class PseudoModal(discord.ui.Modal, title="Ton pseudo EVA Arena"):
     pseudo = discord.ui.TextInput(
@@ -307,27 +343,43 @@ async def marquer_absent(interaction, event_id, pseudo):
     await interaction.response.defer()
 
 class MatchView(discord.ui.View):
-    def __init__(self, event_id):
+    """Boutons du /match. L'event est retrouvé grâce au message cliqué,
+    donc les anciens events restent fonctionnels après un redémarrage."""
+    def __init__(self):
         super().__init__(timeout=None)
-        self.event_id = event_id
+
+    async def _event_id(self, interaction):
+        event_id = event_id_from_message(interaction.message.id)
+        if event_id is None:
+            await interaction.response.send_message("Cet event n'existe plus.", ephemeral=True)
+        return event_id
 
     @discord.ui.button(label="✅ Je viens", style=discord.ButtonStyle.success, custom_id="join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = ChoixView(self.event_id)
+        event_id = await self._event_id(interaction)
+        if event_id is None:
+            return
+        view = ChoixView(event_id)
         await interaction.response.send_message("Choisis ton équipe et ta position :", view=view, ephemeral=True)
 
     @discord.ui.button(label="😴 Pas dispo cette fois", style=discord.ButtonStyle.secondary, custom_id="nodispo")
     async def nodispo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        event_id = await self._event_id(interaction)
+        if event_id is None:
+            return
         user_id = str(interaction.user.id)
         if user_id in pseudos_eva:
-            await marquer_absent(interaction, self.event_id, pseudos_eva[user_id])
+            await marquer_absent(interaction, event_id, pseudos_eva[user_id])
         else:
-            modal = PseudoModalAbsent(self.event_id, interaction.user.display_name)
+            modal = PseudoModalAbsent(event_id, interaction.user.display_name)
             await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="❌ Je ne viens plus", style=discord.ButtonStyle.danger, custom_id="leave")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        event = events[self.event_id]
+        event_id = await self._event_id(interaction)
+        if event_id is None:
+            return
+        event = events[event_id]
         user_id = str(interaction.user.id)
         pseudo = pseudos_eva.get(user_id, interaction.user.display_name)
         retirer_joueur(event, user_id)
@@ -338,17 +390,6 @@ class MatchView(discord.ui.View):
         await interaction.message.edit(embed=embed)
         save_events()
         await interaction.response.defer()
-
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    purge_old_events()
-    for event_id, event in events.items():
-        bot.add_view(MatchView(event_id))
-    print(f"✅ Bot EVA connecté : {bot.user}")
-    print(f"💾 Stockage : {'GitHub (' + GITHUB_REPO + ')' if USE_GITHUB else 'fichiers locaux'}")
-    print(f"📋 Pseudos chargés : {len(pseudos_eva)} joueur(s)")
-    print(f"📅 Events actifs : {len(events)}")
 
 @bot.tree.command(name="match", description="Créer un event 4v4 EVA")
 async def match(interaction: discord.Interaction, titre: str, date: str):
@@ -366,13 +407,180 @@ async def match(interaction: discord.Interaction, titre: str, date: str):
         "message_id": None
     }
     embed = build_embed(titre, date, [], [], [], [])
-    view = MatchView(event_id)
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.response.send_message(embed=embed, view=MatchView())
     msg = await interaction.original_response()
     events[event_id]["message_id"] = msg.id
     save_events()
 
-# ── Mini serveur web : garde le service éveillé sur Render ─────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  /orga : session interne de la team (une seule liste "Présents")
+# ═══════════════════════════════════════════════════════════════════════════
+def parse_date_heure(date_str, heure_str):
+    """'14/10/2026' ou '14/10' + '22:00' / '22h00' / '22h' -> datetime Paris"""
+    date_str = date_str.strip().replace("-", "/").replace(".", "/")
+    heure_str = heure_str.strip().lower().replace("h", ":")
+    if heure_str.endswith(":"):
+        heure_str += "00"
+    t = datetime.strptime(heure_str, "%H:%M")
+
+    parts = date_str.split("/")
+    if len(parts) == 2:
+        now = datetime.now(PARIS)
+        d = datetime.strptime(f"{date_str}/{now.year}", "%d/%m/%Y")
+        debut = datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=PARIS)
+        if debut < now - timedelta(days=1):
+            debut = debut.replace(year=now.year + 1)
+        return debut
+
+    d = datetime.strptime(date_str, "%d/%m/%Y")
+    return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=PARIS)
+
+def build_team_embed(ev):
+    ts = ev["start_ts"]
+    n = ev["nb_sessions"]
+    d = ev["duree"]
+    horaires = " · ".join(f"<t:{ts + i * d * 60}:t>" for i in range(n))
+
+    embed = discord.Embed(
+        title=f"🎮 {ev['titre']}",
+        description=(
+            f"**Organisé par** {ev['organisateur']}\n\n"
+            f"**Description**\n{ev['description']}\n\n"
+            f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
+            f"**Sessions ({n} × {d}min)**\n{horaires}"
+        ),
+        color=0x2ECC71
+    )
+
+    presents = ev["presents"]
+    liste = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(presents, 1))
+    embed.add_field(
+        name=f"✅ Présents ({len(presents)})",
+        value=(liste or "_Personne pour l'instant_")[:1024],
+        inline=False
+    )
+    if ev["absents"]:
+        embed.add_field(
+            name="😴 Pas dispo",
+            value="\n".join(f"• {p['pseudo']}" for p in ev["absents"])[:1024],
+            inline=False
+        )
+    if ev["annules"]:
+        embed.add_field(
+            name="❌ Ne vient plus",
+            value="\n".join(f"• {p['pseudo']}" for p in ev["annules"])[:1024],
+            inline=False
+        )
+    embed.set_footer(text="Clique sur un bouton pour répondre")
+    return embed
+
+def retirer_team(ev, user_id):
+    for cle in ("presents", "absents", "annules"):
+        ev[cle] = [p for p in ev[cle] if p["id"] != user_id]
+
+class TeamView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _repondre(self, interaction, liste):
+        ev = team_events.get(str(interaction.message.id))
+        if not ev:
+            await interaction.response.send_message("Cette session n'existe plus.", ephemeral=True)
+            return
+        user_id = str(interaction.user.id)
+        retirer_team(ev, user_id)
+        ev[liste].append({"id": user_id, "pseudo": pseudo_de(interaction.user)})
+        await interaction.response.edit_message(embed=build_team_embed(ev))
+        save_team_events()
+
+    @discord.ui.button(label="✅ Présent", style=discord.ButtonStyle.success, custom_id="team_present")
+    async def present(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._repondre(interaction, "presents")
+
+    @discord.ui.button(label="😴 Pas dispo", style=discord.ButtonStyle.secondary, custom_id="team_nodispo")
+    async def nodispo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._repondre(interaction, "absents")
+
+    @discord.ui.button(label="❌ Je ne viens plus", style=discord.ButtonStyle.danger, custom_id="team_leave")
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._repondre(interaction, "annules")
+
+@app_commands.command(name="orga", description="Créer une session EVA pour la team")
+@app_commands.describe(
+    date="Date : JJ/MM/AAAA ou JJ/MM (ex : 14/10/2026)",
+    heure="Heure de début (ex : 22:00 ou 22h)",
+    description="Ex : mix chill",
+    sessions="Nombre de sessions (défaut : 2)",
+    duree="Durée d'une session en minutes (défaut : 40)",
+    titre="Titre de l'annonce (défaut : Session EVA)",
+)
+async def session_cmd(
+    interaction: discord.Interaction,
+    date: str,
+    heure: str,
+    description: str = "mix chill",
+    sessions: app_commands.Range[int, 1, 10] = 2,
+    duree: app_commands.Range[int, 10, 180] = 40,
+    titre: str = "Session EVA",
+):
+    try:
+        debut = parse_date_heure(date, heure)
+    except ValueError:
+        await interaction.response.send_message(
+            "Format invalide. Exemple : date `14/10/2026`, heure `22:00`", ephemeral=True
+        )
+        return
+
+    ev = {
+        "titre": titre,
+        "organisateur": pseudo_de(interaction.user),
+        "description": description,
+        "start_ts": int(debut.timestamp()),
+        "nb_sessions": sessions,
+        "duree": duree,
+        "presents": [],
+        "absents": [],
+        "annules": [],
+    }
+    await interaction.response.send_message(embed=build_team_embed(ev), view=TeamView())
+    msg = await interaction.original_response()
+    team_events[str(msg.id)] = ev
+    save_team_events()
+
+if TEAM_GUILD:
+    bot.tree.add_command(session_cmd, guild=TEAM_GUILD)
+else:
+    bot.tree.add_command(session_cmd)
+
+# ── Démarrage ──────────────────────────────────────────────────────────────
+_deja_pret = False
+
+@bot.event
+async def on_ready():
+    global _deja_pret
+    if _deja_pret:
+        return
+    _deja_pret = True
+
+    await bot.tree.sync()
+    if TEAM_GUILD:
+        try:
+            await bot.tree.sync(guild=TEAM_GUILD)
+        except discord.HTTPException as e:
+            print(f"⚠️ Sync serveur team impossible (bot pas invité ?) : {e}")
+
+    purge_old_events()
+    purge_old_team_events()
+    bot.add_view(MatchView())
+    bot.add_view(TeamView())
+    print(f"✅ Bot EVA connecté : {bot.user}")
+    print(f"💾 Stockage : {'GitHub (' + GITHUB_REPO + ')' if USE_GITHUB else 'fichiers locaux'}")
+    print(f"📋 Pseudos chargés : {len(pseudos_eva)} joueur(s)")
+    print(f"📅 Events /match actifs : {len(events)}")
+    print(f"🎮 Sessions team actives : {len(team_events)}")
+    print(f"🏠 Serveur team : {TEAM_GUILD_ID or 'non défini (/orga partout)'}")
+
+# ── Mini serveur web (inutile sur Google Cloud, sans effet) ────────────────
 app = Flask(__name__)
 
 @app.route("/")
