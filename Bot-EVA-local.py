@@ -186,6 +186,7 @@ def pseudo_de(user):
 #  /match : event 4v4 (serveur EVA)
 # ═══════════════════════════════════════════════════════════════════════════
 POSITIONS = ["⚡ Rusher", "🛡️ Teneur de ligne"]
+BOOKING_URL = "https://app.eva.gg/fr-FR/booking?locationId=52&gameIds=1&seatCount=1&isCompetitiveMode=true"
 
 def build_embed(titre, date, equipe1, equipe2, absents, annules):
     embed = discord.Embed(
@@ -193,7 +194,7 @@ def build_embed(titre, date, equipe1, equipe2, absents, annules):
         description=(
             f"📅 {date}\n\n"
             f"**Pour réserver ta session :**\n"
-            f"https://app.eva.gg/fr-FR/booking?locationId=52&gameIds=1&seatCount=1&isCompetitiveMode=true"
+            f"{BOOKING_URL}"
         ),
         color=0x9B59B6
     )
@@ -415,25 +416,68 @@ async def match(interaction: discord.Interaction, titre: str, date: str):
 # ═══════════════════════════════════════════════════════════════════════════
 #  /orga : session interne de la team (une seule liste "Présents")
 # ═══════════════════════════════════════════════════════════════════════════
+MOIS_FR = {
+    "janvier": 1, "janv": 1, "jan": 1,
+    "fevrier": 2, "février": 2, "fevr": 2, "févr": 2, "fev": 2, "fév": 2,
+    "mars": 3, "mar": 3,
+    "avril": 4, "avr": 4,
+    "mai": 5,
+    "juin": 6,
+    "juillet": 7, "juil": 7,
+    "aout": 8, "août": 8,
+    "septembre": 9, "sept": 9, "sep": 9,
+    "octobre": 10, "oct": 10,
+    "novembre": 11, "nov": 11,
+    "decembre": 12, "décembre": 12, "dec": 12, "déc": 12,
+}
+JOURS_FR = {"lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"}
+
+def parse_heure(heure_str):
+    """'22:00', '22h00', '22h', '22', '22.30', '22 h 30' -> (h, m)"""
+    s = heure_str.strip().lower().replace(" ", "")
+    for sep in ("h", ".", ":"):
+        s = s.replace(sep, ":")
+    if s.endswith(":"):
+        s = s[:-1]
+    parts = s.split(":")
+    if not (1 <= len(parts) <= 2) or not all(p.isdigit() for p in parts):
+        raise ValueError
+    h = int(parts[0])
+    m = int(parts[1]) if len(parts) == 2 else 0
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError
+    return h, m
+
+def parse_date(date_str):
+    """'14/10/2026', '14/10/26', '14/10', '14-10', '14 octobre', 'mercredi 14 oct'
+    -> (jour, mois, annee ou None)"""
+    s = date_str.strip().lower().replace(",", " ")
+    for sep in ("-", ".", " "):
+        s = s.replace(sep, "/")
+    parts = [p for p in s.split("/") if p and p not in JOURS_FR]
+    if len(parts) not in (2, 3):
+        raise ValueError
+    jour = int(parts[0])
+    mois = int(parts[1]) if parts[1].isdigit() else MOIS_FR.get(parts[1])
+    if mois is None:
+        raise ValueError
+    annee = None
+    if len(parts) == 3:
+        annee = int(parts[2])
+        if annee < 100:
+            annee += 2000
+    return jour, mois, annee
+
 def parse_date_heure(date_str, heure_str):
-    """'14/10/2026' ou '14/10' + '22:00' / '22h00' / '22h' -> datetime Paris"""
-    date_str = date_str.strip().replace("-", "/").replace(".", "/")
-    heure_str = heure_str.strip().lower().replace("h", ":")
-    if heure_str.endswith(":"):
-        heure_str += "00"
-    t = datetime.strptime(heure_str, "%H:%M")
-
-    parts = date_str.split("/")
-    if len(parts) == 2:
-        now = datetime.now(PARIS)
-        d = datetime.strptime(f"{date_str}/{now.year}", "%d/%m/%Y")
-        debut = datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=PARIS)
-        if debut < now - timedelta(days=1):
-            debut = debut.replace(year=now.year + 1)
-        return debut
-
-    d = datetime.strptime(date_str, "%d/%m/%Y")
-    return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=PARIS)
+    h, m = parse_heure(heure_str)
+    jour, mois, annee = parse_date(date_str)
+    if annee is not None:
+        return datetime(annee, mois, jour, h, m, tzinfo=PARIS)
+    now = datetime.now(PARIS)
+    debut = datetime(now.year, mois, jour, h, m, tzinfo=PARIS)
+    if debut < now - timedelta(days=1):
+        debut = debut.replace(year=now.year + 1)
+    return debut
 
 def build_team_embed(ev):
     ts = ev["start_ts"]
@@ -447,7 +491,8 @@ def build_team_embed(ev):
             f"**Organisé par** {ev['organisateur']}\n\n"
             f"**Description**\n{ev['description']}\n\n"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
-            f"**Sessions ({n} × {d}min)**\n{horaires}"
+            f"**Sessions ({n} × {d}min)**\n{horaires}\n\n"
+            f"**Pour réserver ta session :**\n{BOOKING_URL}"
         ),
         color=0x2ECC71
     )
@@ -505,21 +550,29 @@ class TeamView(discord.ui.View):
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._repondre(interaction, "annules")
 
+DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
+
 @app_commands.command(name="orga", description="Créer une session EVA pour la team")
 @app_commands.describe(
-    date="Date : JJ/MM/AAAA ou JJ/MM (ex : 14/10/2026)",
-    heure="Heure de début (ex : 22:00 ou 22h)",
-    description="Ex : mix chill",
-    sessions="Nombre de sessions (défaut : 2)",
+    date="Choisis dans la liste ou tape JJ/MM (année en cours ajoutée)",
+    heure="Heure de début (ex : 22, 22h, 22h10, 22:10, 22.10)",
+    sessions="Combien de sessions à partir de l'heure de début ?",
+    description="Mix chill, Train, Split… ou tape ton propre texte",
     duree="Durée d'une session en minutes (défaut : 40)",
     titre="Titre de l'annonce (défaut : Session EVA)",
 )
+@app_commands.choices(sessions=[
+    app_commands.Choice(name="1 session", value=1),
+    app_commands.Choice(name="2 sessions", value=2),
+    app_commands.Choice(name="3 sessions", value=3),
+    app_commands.Choice(name="4 sessions", value=4),
+])
 async def session_cmd(
     interaction: discord.Interaction,
     date: str,
     heure: str,
-    description: str = "mix chill",
-    sessions: app_commands.Range[int, 1, 10] = 2,
+    sessions: app_commands.Choice[int],
+    description: str,
     duree: app_commands.Range[int, 10, 180] = 40,
     titre: str = "Session EVA",
 ):
@@ -527,16 +580,18 @@ async def session_cmd(
         debut = parse_date_heure(date, heure)
     except ValueError:
         await interaction.response.send_message(
-            "Format invalide. Exemple : date `14/10/2026`, heure `22:00`", ephemeral=True
+            f"Je n'ai pas compris la date `{date}` ou l'heure `{heure}`.\n"
+            f"Exemples : date `14/10/2026` ou `14/10`, heure `22`, `22h10` ou `22:10`",
+            ephemeral=True
         )
         return
 
     ev = {
         "titre": titre,
         "organisateur": pseudo_de(interaction.user),
-        "description": description,
+        "description": description.strip() or "Mix chill",
         "start_ts": int(debut.timestamp()),
-        "nb_sessions": sessions,
+        "nb_sessions": sessions.value,
         "duree": duree,
         "presents": [],
         "absents": [],
@@ -546,6 +601,51 @@ async def session_cmd(
     msg = await interaction.original_response()
     team_events[str(msg.id)] = ev
     save_team_events()
+
+JOURS_COURTS = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
+
+@session_cmd.autocomplete("date")
+async def date_autocomplete(interaction: discord.Interaction, current: str):
+    """Pré-remplit la date : les 14 prochains jours, ou la date tapée complétée avec l'année."""
+    tape = current.strip()
+    options = []
+
+    if tape:
+        try:
+            jour, mois, annee = parse_date(tape)
+            if annee is None:
+                debut = parse_date_heure(tape, "0")
+                annee = debut.year
+            d = datetime(annee, mois, jour)
+            valeur = d.strftime("%d/%m/%Y")
+            options.append(app_commands.Choice(name=f"{JOURS_COURTS[d.weekday()]} {valeur}", value=valeur))
+        except (ValueError, TypeError):
+            pass
+
+    aujourd_hui = datetime.now(PARIS).date()
+    for i in range(14):
+        d = aujourd_hui + timedelta(days=i)
+        valeur = d.strftime("%d/%m/%Y")
+        if tape and not valeur.startswith(tape) and tape not in valeur:
+            continue
+        if any(o.value == valeur for o in options):
+            continue
+        prefixe = "Aujourd'hui" if i == 0 else "Demain" if i == 1 else JOURS_COURTS[d.weekday()]
+        options.append(app_commands.Choice(name=f"{prefixe} {valeur}", value=valeur))
+
+    if tape and not options:
+        options.append(app_commands.Choice(name=f"✏️ {tape}"[:100], value=tape[:100]))
+    return options[:25]
+
+@session_cmd.autocomplete("description")
+async def description_autocomplete(interaction: discord.Interaction, current: str):
+    """Propose les présets, et garde ce que l'utilisateur tape comme choix libre."""
+    tape = current.strip()
+    choix = [p for p in DESCRIPTIONS_PRESETS if tape.lower() in p.lower()]
+    options = [app_commands.Choice(name=p, value=p) for p in choix]
+    if tape and tape.lower() not in [p.lower() for p in DESCRIPTIONS_PRESETS]:
+        options.append(app_commands.Choice(name=f"✏️ {tape}"[:100], value=tape[:100]))
+    return options[:25]
 
 if TEAM_GUILD:
     bot.tree.add_command(session_cmd, guild=TEAM_GUILD)
