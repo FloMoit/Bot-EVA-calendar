@@ -177,6 +177,15 @@ async def creer_fil(msg, nom):
 
 BOOKING_URL = "https://app.eva.gg/fr-FR/booking?locationId=52&gameIds=1&seatCount=1&isCompetitiveMode=true"
 
+def lien_reservation(ts):
+    """Lien EVA qui ouvre directement le calendrier au jour de la session."""
+    jour = datetime.fromtimestamp(ts, PARIS).strftime("%Y-%m-%d")
+    return (
+        "https://app.eva.gg/fr-FR/booking/calendar?locationId=52&gameIds=1&seatCount=1"
+        "&isCompetitiveMode=true&origin=%2Fbooking%3FlocationId%3D52%26gameIds%3D1"
+        f"%26seatCount%3D1%26isCompetitiveMode%3Dtrue&currentDate={jour}"
+    )
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  /orga : session interne de la team (une seule liste "Présents")
 # ═══════════════════════════════════════════════════════════════════════════
