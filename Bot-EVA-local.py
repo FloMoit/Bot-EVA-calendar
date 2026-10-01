@@ -296,7 +296,7 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce):
         f"✅ **Session complète pour EVA : {ev['titre']}**\n"
         f"📅 <t:{ts}:F>\n\n"
         f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
-        f"Merci de réserver ta place dès maintenant :\n{BOOKING_URL}\n\n"
+        f"Merci de réserver ta place dès maintenant :\n<{BOOKING_URL}>\n\n"
         f"Lien vers l'organisation de la partie sur Discord :\n{lien_annonce}"
     )
     try:
