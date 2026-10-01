@@ -7,6 +7,7 @@ import sys
 import queue
 import base64
 import threading
+import time
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -67,18 +68,24 @@ def _gh_url(filename):
     return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
 
 def github_load(filename):
-    try:
-        r = requests.get(_gh_url(filename), headers=_gh_headers(),
-                         params={"ref": GITHUB_BRANCH}, timeout=15)
-        if r.status_code == 200:
-            decoded = base64.b64decode(r.json()["content"]).decode("utf-8")
-            return json.loads(decoded) if decoded.strip() else {}
-        if r.status_code == 404:
-            return {}
-        print(f"⚠️ GitHub load {filename} : {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"⚠️ Erreur github_load {filename} : {e}")
-    return {}
+    """Lit un fichier JSON sur GitHub. Réessaie 3 fois ; si GitHub reste
+    injoignable, arrête le bot (il redémarre tout seul 30 s plus tard)
+    plutôt que de démarrer à vide et d'écraser les données."""
+    for essai in range(3):
+        try:
+            r = requests.get(_gh_url(filename), headers=_gh_headers(),
+                             params={"ref": GITHUB_BRANCH}, timeout=15)
+            if r.status_code == 200:
+                decoded = base64.b64decode(r.json()["content"]).decode("utf-8")
+                return json.loads(decoded) if decoded.strip() else {}
+            if r.status_code == 404:
+                return {}
+            print(f"⚠️ GitHub load {filename} : {r.status_code} {r.text}")
+        except Exception as e:
+            print(f"⚠️ Erreur github_load {filename} : {e}")
+        time.sleep(5)
+    print(f"❌ Impossible de lire {filename} sur GitHub : arrêt pour protéger les données")
+    sys.exit(1)
 
 def _github_write(filename, json_str):
     try:
@@ -165,6 +172,17 @@ def pseudo_de(user):
 def joueur_lien(p):
     """Mention cliquable : affiche le pseudo du serveur et ouvre le profil Discord."""
     return f"<@{p['id']}>"
+
+def liste_champ(lignes, vide="_Personne pour l'instant_"):
+    """Assemble des lignes sans dépasser la limite Discord (1024) ni couper un pseudo."""
+    texte = ""
+    for i, ligne in enumerate(lignes):
+        reste = len(lignes) - i
+        suite = f"\n… et {reste} autre(s)"
+        if len(texte) + len(ligne) + 1 + len(suite) > 1024:
+            return texte + suite
+        texte += ("\n" if texte else "") + ligne
+    return texte or vide
 
 async def creer_fil(msg, nom):
     """Crée un fil de discussion sous l'annonce. Renvoie l'id du fil ou None."""
@@ -260,10 +278,10 @@ def build_team_embed(ev):
     orga = f"<@{ev['organisateur_id']}>" if ev.get("organisateur_id") else ev["organisateur"]
 
     embed = discord.Embed(
-        title=f"🎮 {ev['titre']}",
+        title=f"🎮 {ev['titre']}"[:256],
         description=(
             f"**Organisé par** {orga}\n\n"
-            f"**Description**\n{ev['description']}\n\n"
+            f"**Description**\n{ev['description'][:1000]}\n\n"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires}\n\n"
             f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ts)})**"
@@ -273,42 +291,49 @@ def build_team_embed(ev):
 
     presents = ev["presents"]
     places = ev.get("places", 8)
-    liste = "\n".join(f"{i}. {joueur_lien(p)}" for i, p in enumerate(presents, 1))
     embed.add_field(
         name=f"✅ Inscrits ({len(presents)}/{places})",
-        value=(liste or "_Personne pour l'instant_")[:1024],
+        value=liste_champ([f"{i}. {joueur_lien(p)}" for i, p in enumerate(presents, 1)]),
         inline=False
     )
+    if ev.get("attente"):
+        embed.add_field(
+            name=f"⏳ File d'attente ({len(ev['attente'])})",
+            value=liste_champ([f"{i}. {joueur_lien(p)}" for i, p in enumerate(ev["attente"], 1)]),
+            inline=False
+        )
     if ev["absents"]:
         embed.add_field(
             name="😴 Pas dispo",
-            value="\n".join(f"• {joueur_lien(p)}" for p in ev["absents"])[:1024],
+            value=liste_champ([f"• {joueur_lien(p)}" for p in ev["absents"]]),
             inline=False
         )
     if ev["annules"]:
         embed.add_field(
             name="❌ Ne vient plus",
-            value="\n".join(f"• {joueur_lien(p)}" for p in ev["annules"])[:1024],
+            value=liste_champ([f"• {joueur_lien(p)}" for p in ev["annules"]]),
             inline=False
         )
     embed.set_footer(text="Clique sur un bouton pour répondre")
     return embed
 
 def retirer_team(ev, user_id):
-    for cle in ("presents", "absents", "annules"):
-        ev[cle] = [p for p in ev[cle] if p["id"] != user_id]
+    for cle in ("presents", "attente", "absents", "annules"):
+        ev[cle] = [p for p in ev.get(cle, []) if p["id"] != user_id]
 
-async def envoyer_dm_complet(user_id, ev, lien_annonce):
+async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
     ts = ev["start_ts"]
     joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
+    titre = (f"🎉 Une place s'est libérée, tu es inscrit : {ev['titre']}" if promu
+             else f"✅ Session complète pour EVA : {ev['titre']}")
     embed = discord.Embed(
-        title=f"✅ Session complète pour EVA : {ev['titre']}",
+        title=titre[:256],
         description=(
             f"📅 <t:{ts}:F>\n\n"
             f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
             f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ts)})**\n\n"
             f"**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
-        ),
+        )[:4096],
         color=0x2ECC71
     )
     try:
@@ -321,33 +346,58 @@ class TeamView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def _repondre(self, interaction, liste):
+    async def _repondre(self, interaction, action):
         ev = team_events.get(str(interaction.message.id))
         if not ev:
             await interaction.response.send_message("Cette session n'existe plus.", ephemeral=True)
             return
+        ev.setdefault("attente", [])
         user_id = str(interaction.user.id)
-        if liste == "presents":
-            deja = any(p["id"] == user_id for p in ev["presents"])
-            if not deja and len(ev["presents"]) >= ev.get("places", 8):
-                await interaction.response.send_message("La session est complète !", ephemeral=True)
+        joueur = {"id": user_id, "pseudo": pseudo_de(interaction.user)}
+        places = ev.get("places", 8)
+        inscrit = any(p["id"] == user_id for p in ev["presents"])
+        en_attente = any(p["id"] == user_id for p in ev["attente"])
+        promu = None
+        info = None
+
+        if action in ("presents", "attente"):
+            if inscrit or (en_attente and len(ev["presents"]) >= places):
+                # Déjà à sa place : on ne touche à rien
+                await interaction.response.defer()
                 return
-        retirer_team(ev, user_id)
-        if liste:
-            ev[liste].append({"id": user_id, "pseudo": pseudo_de(interaction.user)})
+            retirer_team(ev, user_id)
+            if len(ev["presents"]) < places:
+                ev["presents"].append(joueur)
+            else:
+                ev["attente"].append(joueur)
+                info = f"⏳ Session complète : tu es en file d'attente (position {len(ev['attente'])}). Tu recevras un MP si une place se libère."
+        else:  # Sortir
+            retirer_team(ev, user_id)
+            # Une place se libère : le 1er de la file d'attente la prend
+            if inscrit and ev["attente"] and len(ev["presents"]) < places:
+                promu = ev["attente"].pop(0)
+                ev["presents"].append(promu)
+
         await interaction.response.edit_message(embed=build_team_embed(ev), view=TeamView())
         save_team_events()
+        if info:
+            await interaction.followup.send(info, ephemeral=True)
 
-        # Session pleine : DM à tous la 1re fois, puis à chaque nouvel arrivant
-        if liste == "presents" and not deja and len(ev["presents"]) >= ev.get("places", 8):
-            if not ev.get("dm_complet"):
-                ev["dm_complet"] = True
+        # Session pleine : MP à chaque joueur qui ne l'a pas encore reçu
+        if len(ev["presents"]) >= places:
+            deja_prevenus = set(ev.get("dm_envoyes", []))
+            if ev.get("dm_complet") and not deja_prevenus:
+                # ancien format : les inscrits d'avant ont déjà été prévenus
+                deja_prevenus = {p["id"] for p in ev["presents"] if p["id"] != user_id}
+            cibles = [p["id"] for p in ev["presents"] if p["id"] not in deja_prevenus]
+            if promu and promu["id"] not in cibles:
+                cibles.append(promu["id"])
+            if cibles:
+                ev["dm_envoyes"] = sorted(deja_prevenus | set(cibles))
                 save_team_events()
-                cibles = [p["id"] for p in ev["presents"]]
-            else:
-                cibles = [user_id]
             for uid in cibles:
-                await envoyer_dm_complet(uid, ev, interaction.message.jump_url)
+                await envoyer_dm_complet(uid, ev, interaction.message.jump_url,
+                                         promu=bool(promu and uid == promu["id"]))
 
     @discord.ui.button(label="✅ Présent", style=discord.ButtonStyle.success, custom_id="team_present")
     async def present(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -357,9 +407,19 @@ class TeamView(discord.ui.View):
     async def nodispo(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._repondre(interaction, None)
 
+    @discord.ui.button(label="⏳ File d'attente", style=discord.ButtonStyle.primary, custom_id="team_attente")
+    async def attente(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._repondre(interaction, "attente")
+
+class AncienBoutonView(discord.ui.View):
+    """Bouton "Je ne viens plus" des annonces publiées avant la mise à jour :
+    il agit comme "Sortir" et l'annonce passe aux nouveaux boutons."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
     @discord.ui.button(label="❌ Je ne viens plus", style=discord.ButtonStyle.danger, custom_id="team_leave")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._repondre(interaction, "annules")
+        await TeamView()._repondre(interaction, None)
 
 DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
 
@@ -371,7 +431,7 @@ DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
     description="Mix chill, Train, Split… ou tape ton propre texte",
     duree="Durée d'une session en minutes (défaut : 40)",
     titre="Titre de l'annonce (défaut : Session EVA)",
-    places="Nombre de places (défaut : 8)",
+    places="Nombre de places, 30 max (défaut : 8)",
 )
 @app_commands.choices(sessions=[
     app_commands.Choice(name="1 session", value=1),
@@ -386,8 +446,8 @@ async def session_cmd(
     sessions: app_commands.Choice[int],
     description: str,
     duree: app_commands.Range[int, 10, 180] = 40,
-    titre: str = "Session EVA",
-    places: app_commands.Range[int, 1, 50] = 8,
+    titre: app_commands.Range[str, 1, 100] = "Session EVA",
+    places: app_commands.Range[int, 1, 30] = 8,
 ):
     try:
         debut = parse_date_heure(date, heure)
@@ -398,17 +458,23 @@ async def session_cmd(
             ephemeral=True
         )
         return
+    if debut < datetime.now(PARIS) - timedelta(hours=1):
+        await interaction.response.send_message(
+            f"La date `{date}` à `{heure}` est déjà passée.", ephemeral=True
+        )
+        return
 
     ev = {
         "titre": titre,
         "organisateur": pseudo_de(interaction.user),
         "organisateur_id": str(interaction.user.id),
-        "description": description.strip() or "Mix chill",
+        "description": description.strip()[:300] or "Mix chill",
         "start_ts": int(debut.timestamp()),
         "nb_sessions": sessions.value,
         "duree": duree,
         "places": places,
         "presents": [],
+        "attente": [],
         "absents": [],
         "annules": [],
     }
@@ -485,18 +551,26 @@ async def supprimer_salon_ou_message(channel_id, message_id=None):
 
 @tasks.loop(minutes=30)
 async def nettoyage_j1():
+    """Ne s'arrête jamais : une erreur sur une session n'empêche pas les autres."""
     maintenant = datetime.now(timezone.utc).timestamp()
     a_supprimer = []
-    for mid, ev in team_events.items():
-        fin = ev["start_ts"] + ev["nb_sessions"] * ev["duree"] * 60
-        if maintenant > fin + 24 * 3600:
+    for mid, ev in list(team_events.items()):
+        try:
+            fin = ev["start_ts"] + ev.get("nb_sessions", 1) * ev.get("duree", 40) * 60
+            if maintenant > fin + 24 * 3600:
+                a_supprimer.append(mid)
+        except Exception as e:
+            print(f"⚠️ Session {mid} illisible, supprimée : {e}")
             a_supprimer.append(mid)
     for mid in a_supprimer:
-        ev = team_events.pop(mid)
-        if ev.get("thread_id"):
-            await supprimer_salon_ou_message(ev["thread_id"])
-        if ev.get("channel_id"):
-            await supprimer_salon_ou_message(ev["channel_id"], int(mid))
+        ev = team_events.pop(mid, {})
+        try:
+            if ev.get("thread_id"):
+                await supprimer_salon_ou_message(ev["thread_id"])
+            if ev.get("channel_id"):
+                await supprimer_salon_ou_message(ev["channel_id"], int(mid))
+        except Exception as e:
+            print(f"⚠️ Nettoyage session {mid} : {e}")
     if a_supprimer:
         print(f"🧹 {len(a_supprimer)} session(s) supprimée(s) (J+1)")
         save_team_events()
@@ -527,6 +601,7 @@ async def on_ready():
 
     purge_old_team_events()
     bot.add_view(TeamView())
+    bot.add_view(AncienBoutonView())
     if not nettoyage_j1.is_running():
         nettoyage_j1.start()
     print(f"✅ Bot EVA connecté : {bot.user}")
