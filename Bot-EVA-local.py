@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import os
@@ -20,7 +20,6 @@ else:
 
 CONFIG_FILE = os.path.join(BASE_DIR, "config.txt")
 PSEUDOS_FILE = os.path.join(BASE_DIR, "pseudos.json")
-EVENTS_FILE = os.path.join(BASE_DIR, "events.json")
 TEAM_EVENTS_FILE = os.path.join(BASE_DIR, "team_events.json")
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -142,29 +141,11 @@ def load_pseudos():
 def save_pseudos(pseudos):
     _save("pseudos.json", PSEUDOS_FILE, pseudos)
 
-def load_events():
-    return _load("events.json", EVENTS_FILE)
-
-def save_events():
-    _save("events.json", EVENTS_FILE, events)
-
 def load_team_events():
     return _load("team_events.json", TEAM_EVENTS_FILE)
 
 def save_team_events():
     _save("team_events.json", TEAM_EVENTS_FILE, team_events)
-
-def purge_old_events():
-    limite = datetime.now(timezone.utc) - timedelta(days=30)
-    to_delete = [
-        eid for eid, e in events.items()
-        if datetime.fromisoformat(e.get("created_at", "2000-01-01T00:00:00+00:00")) < limite
-    ]
-    for eid in to_delete:
-        del events[eid]
-    if to_delete:
-        print(f"🗑️ {len(to_delete)} event(s) purgé(s) (> 30 jours)")
-        save_events()
 
 def purge_old_team_events():
     limite = datetime.now(timezone.utc).timestamp() - 30 * 24 * 3600
@@ -176,242 +157,25 @@ def purge_old_team_events():
         save_team_events()
 
 pseudos_eva = load_pseudos()
-events = load_events()
 team_events = load_team_events()
 
 def pseudo_de(user):
     return pseudos_eva.get(str(user.id), user.display_name)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  /match : event 4v4 (serveur EVA)
-# ═══════════════════════════════════════════════════════════════════════════
-POSITIONS = ["⚡ Rusher", "🛡️ Teneur de ligne"]
+def joueur_lien(p):
+    """Mention cliquable (ouvre le profil Discord) + pseudo EVA."""
+    return f"<@{p['id']}> ({p['pseudo']})"
+
+async def creer_fil(msg, nom):
+    """Crée un fil de discussion sous l'annonce. Renvoie l'id du fil ou None."""
+    try:
+        fil = await msg.create_thread(name=nom[:100], auto_archive_duration=1440)
+        return fil.id
+    except discord.HTTPException as e:
+        print(f"⚠️ Fil impossible (permission 'Créer des fils publics' ?) : {e}")
+        return None
+
 BOOKING_URL = "https://app.eva.gg/fr-FR/booking?locationId=52&gameIds=1&seatCount=1&isCompetitiveMode=true"
-
-def build_embed(titre, date, equipe1, equipe2, absents, annules):
-    embed = discord.Embed(
-        title=f"⚔️ {titre}",
-        description=(
-            f"📅 {date}\n\n"
-            f"**Pour réserver ta session :**\n"
-            f"{BOOKING_URL}"
-        ),
-        color=0x9B59B6
-    )
-
-    def format_team(players):
-        lines = [f"• {p['pseudo']} — {p['position']}" for p in players]
-        while len(lines) < 4:
-            lines.append("_(vide)_")
-        return "\n".join(lines)
-
-    embed.add_field(name="🔵 Équipe 1", value=format_team(equipe1), inline=True)
-    embed.add_field(name="​", value="​", inline=True)
-    embed.add_field(name="🔴 Équipe 2", value=format_team(equipe2), inline=True)
-
-    if absents:
-        embed.add_field(
-            name="😴 Pas dispo cette fois",
-            value="\n".join([f"• {a[1]}" for a in absents]),
-            inline=False
-        )
-
-    if annules:
-        embed.add_field(
-            name="❌ Ne vient plus",
-            value="\n".join([f"• {a[1]}" for a in annules]),
-            inline=False
-        )
-
-    embed.set_footer(text="Clique sur un bouton pour t'inscrire")
-    return embed
-
-def retirer_joueur(event, user_id):
-    event["equipe1"] = [p for p in event["equipe1"] if p["id"] != user_id]
-    event["equipe2"] = [p for p in event["equipe2"] if p["id"] != user_id]
-    if user_id in event["absents_ids"]:
-        event["absents_ids"].remove(user_id)
-        event["absents"] = [a for a in event["absents"] if a[0] != user_id]
-    if user_id in event["annules_ids"]:
-        event["annules_ids"].remove(user_id)
-        event["annules"] = [a for a in event["annules"] if a[0] != user_id]
-
-def event_id_from_message(message_id):
-    for eid, e in events.items():
-        if e.get("message_id") == message_id:
-            return eid
-    return None
-
-class PseudoModal(discord.ui.Modal, title="Ton pseudo EVA Arena"):
-    pseudo = discord.ui.TextInput(
-        label="Pseudo EVA",
-        placeholder="Entre ton pseudo EVA Arena...",
-        max_length=32
-    )
-
-    def __init__(self, event_id, equipe, position, default_pseudo):
-        super().__init__()
-        self.event_id = event_id
-        self.equipe = equipe
-        self.position = position
-        self.pseudo.default = default_pseudo
-
-    async def on_submit(self, interaction: discord.Interaction):
-        user_id = str(interaction.user.id)
-        pseudo = self.pseudo.value
-        pseudos_eva[user_id] = pseudo
-        save_pseudos(pseudos_eva)
-        await inscrire_joueur(interaction, self.event_id, pseudo, self.position, self.equipe)
-
-class PseudoModalAbsent(discord.ui.Modal, title="Ton pseudo EVA Arena"):
-    pseudo = discord.ui.TextInput(
-        label="Pseudo EVA",
-        placeholder="Entre ton pseudo EVA Arena...",
-        max_length=32
-    )
-
-    def __init__(self, event_id, default_pseudo):
-        super().__init__()
-        self.event_id = event_id
-        self.pseudo.default = default_pseudo
-
-    async def on_submit(self, interaction: discord.Interaction):
-        user_id = str(interaction.user.id)
-        pseudo = self.pseudo.value
-        pseudos_eva[user_id] = pseudo
-        save_pseudos(pseudos_eva)
-        await marquer_absent(interaction, self.event_id, pseudo)
-
-class ChoixView(discord.ui.View):
-    def __init__(self, event_id):
-        super().__init__(timeout=60)
-        self.event_id = event_id
-        for equipe in ["🔵 Équipe 1", "🔴 Équipe 2"]:
-            for pos in POSITIONS:
-                self.add_item(ChoixButton(equipe, pos, event_id))
-
-class ChoixButton(discord.ui.Button):
-    def __init__(self, equipe, position, event_id):
-        style = discord.ButtonStyle.primary if "🔵" in equipe else discord.ButtonStyle.danger
-        super().__init__(label=f"{equipe} — {position}", style=style)
-        self.equipe = equipe
-        self.position = position
-        self.event_id = event_id
-
-    async def callback(self, interaction: discord.Interaction):
-        user_id = str(interaction.user.id)
-        if user_id in pseudos_eva:
-            await inscrire_joueur(interaction, self.event_id, pseudos_eva[user_id], self.position, self.equipe)
-        else:
-            default = interaction.user.display_name
-            modal = PseudoModal(self.event_id, self.equipe, self.position, default)
-            await interaction.response.send_modal(modal)
-
-async def inscrire_joueur(interaction, event_id, pseudo, position, equipe):
-    event = events[event_id]
-    user_id = str(interaction.user.id)
-
-    retirer_joueur(event, user_id)
-
-    joueur = {"id": user_id, "pseudo": pseudo, "position": position}
-    cible = event["equipe1"] if "1" in equipe else event["equipe2"]
-
-    if len(cible) < 4:
-        cible.append(joueur)
-    else:
-        await interaction.response.send_message("Cette équipe est complète !", ephemeral=True)
-        return
-
-    embed = build_embed(event["titre"], event["date"], event["equipe1"], event["equipe2"], event["absents"], event["annules"])
-    msg = await interaction.channel.fetch_message(event["message_id"])
-    await msg.edit(embed=embed)
-    save_events()
-    await interaction.response.defer()
-
-async def marquer_absent(interaction, event_id, pseudo):
-    event = events[event_id]
-    user_id = str(interaction.user.id)
-
-    retirer_joueur(event, user_id)
-
-    event["absents_ids"].append(user_id)
-    event["absents"].append((user_id, pseudo))
-
-    embed = build_embed(event["titre"], event["date"], event["equipe1"], event["equipe2"], event["absents"], event["annules"])
-    msg = await interaction.channel.fetch_message(event["message_id"])
-    await msg.edit(embed=embed)
-    save_events()
-    await interaction.response.defer()
-
-class MatchView(discord.ui.View):
-    """Boutons du /match. L'event est retrouvé grâce au message cliqué,
-    donc les anciens events restent fonctionnels après un redémarrage."""
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    async def _event_id(self, interaction):
-        event_id = event_id_from_message(interaction.message.id)
-        if event_id is None:
-            await interaction.response.send_message("Cet event n'existe plus.", ephemeral=True)
-        return event_id
-
-    @discord.ui.button(label="✅ Je viens", style=discord.ButtonStyle.success, custom_id="join")
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        event_id = await self._event_id(interaction)
-        if event_id is None:
-            return
-        view = ChoixView(event_id)
-        await interaction.response.send_message("Choisis ton équipe et ta position :", view=view, ephemeral=True)
-
-    @discord.ui.button(label="😴 Pas dispo cette fois", style=discord.ButtonStyle.secondary, custom_id="nodispo")
-    async def nodispo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        event_id = await self._event_id(interaction)
-        if event_id is None:
-            return
-        user_id = str(interaction.user.id)
-        if user_id in pseudos_eva:
-            await marquer_absent(interaction, event_id, pseudos_eva[user_id])
-        else:
-            modal = PseudoModalAbsent(event_id, interaction.user.display_name)
-            await interaction.response.send_modal(modal)
-
-    @discord.ui.button(label="❌ Je ne viens plus", style=discord.ButtonStyle.danger, custom_id="leave")
-    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        event_id = await self._event_id(interaction)
-        if event_id is None:
-            return
-        event = events[event_id]
-        user_id = str(interaction.user.id)
-        pseudo = pseudos_eva.get(user_id, interaction.user.display_name)
-        retirer_joueur(event, user_id)
-        if user_id not in event["annules_ids"]:
-            event["annules_ids"].append(user_id)
-            event["annules"].append((user_id, pseudo))
-        embed = build_embed(event["titre"], event["date"], event["equipe1"], event["equipe2"], event["absents"], event["annules"])
-        await interaction.message.edit(embed=embed)
-        save_events()
-        await interaction.response.defer()
-
-@bot.tree.command(name="match", description="Créer un event 4v4 EVA")
-async def match(interaction: discord.Interaction, titre: str, date: str):
-    event_id = str(interaction.id)
-    events[event_id] = {
-        "titre": titre,
-        "date": date,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "equipe1": [],
-        "equipe2": [],
-        "absents": [],
-        "absents_ids": [],
-        "annules": [],
-        "annules_ids": [],
-        "message_id": None
-    }
-    embed = build_embed(titre, date, [], [], [], [])
-    await interaction.response.send_message(embed=embed, view=MatchView())
-    msg = await interaction.original_response()
-    events[event_id]["message_id"] = msg.id
-    save_events()
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  /orga : session interne de la team (une seule liste "Présents")
@@ -484,11 +248,12 @@ def build_team_embed(ev):
     n = ev["nb_sessions"]
     d = ev["duree"]
     horaires = " · ".join(f"<t:{ts + i * d * 60}:t>" for i in range(n))
+    orga = f"<@{ev['organisateur_id']}>" if ev.get("organisateur_id") else ev["organisateur"]
 
     embed = discord.Embed(
         title=f"🎮 {ev['titre']}",
         description=(
-            f"**Organisé par** {ev['organisateur']}\n\n"
+            f"**Organisé par** {orga}\n\n"
             f"**Description**\n{ev['description']}\n\n"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires}\n\n"
@@ -498,22 +263,23 @@ def build_team_embed(ev):
     )
 
     presents = ev["presents"]
-    liste = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(presents, 1))
+    places = ev.get("places", 8)
+    liste = "\n".join(f"{i}. {joueur_lien(p)}" for i, p in enumerate(presents, 1))
     embed.add_field(
-        name=f"✅ Présents ({len(presents)})",
+        name=f"✅ Inscrits ({len(presents)}/{places})",
         value=(liste or "_Personne pour l'instant_")[:1024],
         inline=False
     )
     if ev["absents"]:
         embed.add_field(
             name="😴 Pas dispo",
-            value="\n".join(f"• {p['pseudo']}" for p in ev["absents"])[:1024],
+            value="\n".join(f"• {joueur_lien(p)}" for p in ev["absents"])[:1024],
             inline=False
         )
     if ev["annules"]:
         embed.add_field(
             name="❌ Ne vient plus",
-            value="\n".join(f"• {p['pseudo']}" for p in ev["annules"])[:1024],
+            value="\n".join(f"• {joueur_lien(p)}" for p in ev["annules"])[:1024],
             inline=False
         )
     embed.set_footer(text="Clique sur un bouton pour répondre")
@@ -522,6 +288,22 @@ def build_team_embed(ev):
 def retirer_team(ev, user_id):
     for cle in ("presents", "absents", "annules"):
         ev[cle] = [p for p in ev[cle] if p["id"] != user_id]
+
+async def envoyer_dm_complet(user_id, ev, lien_annonce):
+    ts = ev["start_ts"]
+    joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
+    texte = (
+        f"✅ **Session complète pour EVA : {ev['titre']}**\n"
+        f"📅 <t:{ts}:F>\n\n"
+        f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
+        f"Merci de réserver ta place dès maintenant :\n{BOOKING_URL}\n\n"
+        f"Lien vers l'organisation de la partie sur Discord :\n{lien_annonce}"
+    )
+    try:
+        user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+        await user.send(texte)
+    except discord.HTTPException as e:
+        print(f"⚠️ DM impossible à {user_id} (MP fermés ?) : {e}")
 
 class TeamView(discord.ui.View):
     def __init__(self):
@@ -533,18 +315,35 @@ class TeamView(discord.ui.View):
             await interaction.response.send_message("Cette session n'existe plus.", ephemeral=True)
             return
         user_id = str(interaction.user.id)
+        if liste == "presents":
+            deja = any(p["id"] == user_id for p in ev["presents"])
+            if not deja and len(ev["presents"]) >= ev.get("places", 8):
+                await interaction.response.send_message("La session est complète !", ephemeral=True)
+                return
         retirer_team(ev, user_id)
-        ev[liste].append({"id": user_id, "pseudo": pseudo_de(interaction.user)})
-        await interaction.response.edit_message(embed=build_team_embed(ev))
+        if liste:
+            ev[liste].append({"id": user_id, "pseudo": pseudo_de(interaction.user)})
+        await interaction.response.edit_message(embed=build_team_embed(ev), view=TeamView())
         save_team_events()
+
+        # Session pleine : DM à tous la 1re fois, puis à chaque nouvel arrivant
+        if liste == "presents" and not deja and len(ev["presents"]) >= ev.get("places", 8):
+            if not ev.get("dm_complet"):
+                ev["dm_complet"] = True
+                save_team_events()
+                cibles = [p["id"] for p in ev["presents"]]
+            else:
+                cibles = [user_id]
+            for uid in cibles:
+                await envoyer_dm_complet(uid, ev, interaction.message.jump_url)
 
     @discord.ui.button(label="✅ Présent", style=discord.ButtonStyle.success, custom_id="team_present")
     async def present(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._repondre(interaction, "presents")
 
-    @discord.ui.button(label="😴 Pas dispo", style=discord.ButtonStyle.secondary, custom_id="team_nodispo")
+    @discord.ui.button(label="🚪 Sortir", style=discord.ButtonStyle.secondary, custom_id="team_nodispo")
     async def nodispo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._repondre(interaction, "absents")
+        await self._repondre(interaction, None)
 
     @discord.ui.button(label="❌ Je ne viens plus", style=discord.ButtonStyle.danger, custom_id="team_leave")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -560,6 +359,7 @@ DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
     description="Mix chill, Train, Split… ou tape ton propre texte",
     duree="Durée d'une session en minutes (défaut : 40)",
     titre="Titre de l'annonce (défaut : Session EVA)",
+    places="Nombre de places (défaut : 8)",
 )
 @app_commands.choices(sessions=[
     app_commands.Choice(name="1 session", value=1),
@@ -575,6 +375,7 @@ async def session_cmd(
     description: str,
     duree: app_commands.Range[int, 10, 180] = 40,
     titre: str = "Session EVA",
+    places: app_commands.Range[int, 1, 50] = 8,
 ):
     try:
         debut = parse_date_heure(date, heure)
@@ -589,16 +390,20 @@ async def session_cmd(
     ev = {
         "titre": titre,
         "organisateur": pseudo_de(interaction.user),
+        "organisateur_id": str(interaction.user.id),
         "description": description.strip() or "Mix chill",
         "start_ts": int(debut.timestamp()),
         "nb_sessions": sessions.value,
         "duree": duree,
+        "places": places,
         "presents": [],
         "absents": [],
         "annules": [],
     }
     await interaction.response.send_message(embed=build_team_embed(ev), view=TeamView())
     msg = await interaction.original_response()
+    ev["channel_id"] = msg.channel.id
+    ev["thread_id"] = await creer_fil(msg, f"{titre} {debut.strftime('%d/%m/%Y %H:%M')}")
     team_events[str(msg.id)] = ev
     save_team_events()
 
@@ -652,6 +457,38 @@ if TEAM_GUILD:
 else:
     bot.tree.add_command(session_cmd)
 
+# ── Nettoyage J+1 : annonce + fil supprimés 24h après la fin de la session ──
+async def supprimer_salon_ou_message(channel_id, message_id=None):
+    try:
+        salon = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        if message_id is None:
+            await salon.delete()
+        else:
+            msg = await salon.fetch_message(message_id)
+            await msg.delete()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as e:
+        print(f"⚠️ Suppression impossible ({channel_id}/{message_id}) : {e}")
+
+@tasks.loop(minutes=30)
+async def nettoyage_j1():
+    maintenant = datetime.now(timezone.utc).timestamp()
+    a_supprimer = []
+    for mid, ev in team_events.items():
+        fin = ev["start_ts"] + ev["nb_sessions"] * ev["duree"] * 60
+        if maintenant > fin + 24 * 3600:
+            a_supprimer.append(mid)
+    for mid in a_supprimer:
+        ev = team_events.pop(mid)
+        if ev.get("thread_id"):
+            await supprimer_salon_ou_message(ev["thread_id"])
+        if ev.get("channel_id"):
+            await supprimer_salon_ou_message(ev["channel_id"], int(mid))
+    if a_supprimer:
+        print(f"🧹 {len(a_supprimer)} session(s) supprimée(s) (J+1)")
+        save_team_events()
+
 # ── Démarrage ──────────────────────────────────────────────────────────────
 _deja_pret = False
 
@@ -669,14 +506,13 @@ async def on_ready():
         except discord.HTTPException as e:
             print(f"⚠️ Sync serveur team impossible (bot pas invité ?) : {e}")
 
-    purge_old_events()
     purge_old_team_events()
-    bot.add_view(MatchView())
     bot.add_view(TeamView())
+    if not nettoyage_j1.is_running():
+        nettoyage_j1.start()
     print(f"✅ Bot EVA connecté : {bot.user}")
     print(f"💾 Stockage : {'GitHub (' + GITHUB_REPO + ')' if USE_GITHUB else 'fichiers locaux'}")
     print(f"📋 Pseudos chargés : {len(pseudos_eva)} joueur(s)")
-    print(f"📅 Events /match actifs : {len(events)}")
     print(f"🎮 Sessions team actives : {len(team_events)}")
     print(f"🏠 Serveur team : {TEAM_GUILD_ID or 'non défini (/orga partout)'}")
 
