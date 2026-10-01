@@ -257,7 +257,7 @@ def build_team_embed(ev):
             f"**Description**\n{ev['description']}\n\n"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires}\n\n"
-            f"**Pour réserver ta session :**\n{BOOKING_URL}"
+            f"**[👉 Clique ici pour réserver ta session]({BOOKING_URL})**"
         ),
         color=0x2ECC71
     )
@@ -296,7 +296,7 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce):
         f"✅ **Session complète pour EVA : {ev['titre']}**\n"
         f"📅 <t:{ts}:F>\n\n"
         f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
-        f"Merci de réserver ta place dès maintenant :\n<{BOOKING_URL}>\n\n"
+        f"**[👉 Clique ici pour réserver ta session](<{BOOKING_URL}>)**\n\n"
         f"Lien vers l'organisation de la partie sur Discord :\n{lien_annonce}"
     )
     try:
