@@ -306,7 +306,7 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce):
         description=(
             f"📅 <t:{ts}:F>\n\n"
             f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
-            f"**[👉 Clique ici pour réserver ta session]({BOOKING_URL})**\n\n"
+            f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ts)})**\n\n"
             f"**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
         ),
         color=0x2ECC71
