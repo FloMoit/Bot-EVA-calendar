@@ -292,16 +292,19 @@ def retirer_team(ev, user_id):
 async def envoyer_dm_complet(user_id, ev, lien_annonce):
     ts = ev["start_ts"]
     joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
-    texte = (
-        f"✅ **Session complète pour EVA : {ev['titre']}**\n"
-        f"📅 <t:{ts}:F>\n\n"
-        f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
-        f"**[👉 Clique ici pour réserver ta session]({BOOKING_URL})**\n\n"
-        f"Lien vers l'organisation de la partie sur Discord :\n{lien_annonce}"
+    embed = discord.Embed(
+        title=f"✅ Session complète pour EVA : {ev['titre']}",
+        description=(
+            f"📅 <t:{ts}:F>\n\n"
+            f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
+            f"**[👉 Clique ici pour réserver ta session]({BOOKING_URL})**\n\n"
+            f"**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
+        ),
+        color=0x2ECC71
     )
     try:
         user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
-        await user.send(texte, suppress_embeds=True)
+        await user.send(embed=embed)
     except discord.HTTPException as e:
         print(f"⚠️ DM impossible à {user_id} (MP fermés ?) : {e}")
 
