@@ -266,7 +266,7 @@ def build_team_embed(ev):
             f"**Description**\n{ev['description']}\n\n"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires}\n\n"
-            f"**[👉 Clique ici pour réserver ta session]({BOOKING_URL})**"
+            f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ts)})**"
         ),
         color=0x2ECC71
     )
