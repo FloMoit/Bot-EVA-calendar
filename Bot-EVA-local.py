@@ -431,7 +431,7 @@ DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
     description="Mix chill, Train, Split… ou tape ton propre texte",
     duree="Durée d'une session en minutes (défaut : 40)",
     titre="Titre de l'annonce (défaut : Session EVA)",
-    places="Nombre de places, 30 max (défaut : 8)",
+    places="Nombre de places, 10 max (défaut : 8)",
 )
 @app_commands.choices(sessions=[
     app_commands.Choice(name="1 session", value=1),
@@ -447,7 +447,7 @@ async def session_cmd(
     description: str,
     duree: app_commands.Range[int, 10, 180] = 40,
     titre: app_commands.Range[str, 1, 100] = "Session EVA",
-    places: app_commands.Range[int, 1, 30] = 8,
+    places: app_commands.Range[int, 1, 10] = 8,
 ):
     try:
         debut = parse_date_heure(date, heure)
