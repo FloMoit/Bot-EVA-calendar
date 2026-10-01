@@ -422,6 +422,7 @@ class AncienBoutonView(discord.ui.View):
         await TeamView()._repondre(interaction, None)
 
 DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
+DUREE_SESSION = 40  # une session EVA dure toujours 40 min
 
 @app_commands.command(name="orga", description="Créer une session EVA pour la team")
 @app_commands.describe(
@@ -429,7 +430,6 @@ DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
     heure="Heure de début (ex : 22, 22h, 22h10, 22:10, 22.10)",
     sessions="Combien de sessions à partir de l'heure de début ?",
     description="Mix chill, Train, Split… ou tape ton propre texte",
-    duree="Durée d'une session en minutes (défaut : 40)",
     titre="Titre de l'annonce (défaut : Session EVA)",
     places="Nombre de places, 10 max (défaut : 8)",
 )
@@ -445,7 +445,6 @@ async def session_cmd(
     heure: str,
     sessions: app_commands.Choice[int],
     description: str,
-    duree: app_commands.Range[int, 10, 180] = 40,
     titre: app_commands.Range[str, 1, 100] = "Session EVA",
     places: app_commands.Range[int, 1, 10] = 8,
 ):
@@ -471,7 +470,7 @@ async def session_cmd(
         "description": description.strip()[:300] or "Mix chill",
         "start_ts": int(debut.timestamp()),
         "nb_sessions": sessions.value,
-        "duree": duree,
+        "duree": DUREE_SESSION,
         "places": places,
         "presents": [],
         "attente": [],
