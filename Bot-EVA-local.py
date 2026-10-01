@@ -163,8 +163,8 @@ def pseudo_de(user):
     return pseudos_eva.get(str(user.id), user.display_name)
 
 def joueur_lien(p):
-    """Mention cliquable (ouvre le profil Discord) + pseudo EVA."""
-    return f"<@{p['id']}> ({p['pseudo']})"
+    """Mention cliquable : affiche le pseudo du serveur et ouvre le profil Discord."""
+    return f"<@{p['id']}>"
 
 async def creer_fil(msg, nom):
     """Crée un fil de discussion sous l'annonce. Renvoie l'id du fil ou None."""
