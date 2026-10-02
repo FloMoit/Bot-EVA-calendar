@@ -1,6 +1,6 @@
 import discord
-from discord.ext import commands, tasks
 from discord import app_commands
+from discord.ext import tasks
 import json
 import os
 import sys
@@ -11,163 +11,125 @@ import time
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from flask import Flask
 
-# ── Dossier de base (utile pour le mode local) ─────────────────────────────
-if getattr(sys, 'frozen', False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-CONFIG_FILE = os.path.join(BASE_DIR, "config.txt")
-PSEUDOS_FILE = os.path.join(BASE_DIR, "pseudos.json")
-TEAM_EVENTS_FILE = os.path.join(BASE_DIR, "team_events.json")
-
+# ═══════════════════════════════════════════════════════════════════════════
+#  Réglages
+# ═══════════════════════════════════════════════════════════════════════════
 PARIS = ZoneInfo("Europe/Paris")
+DUREE_SESSION = 40                      # une session EVA dure toujours 40 min
+PLACES_MAX = 10                         # capacité max de l'arène
+TEL_SALLE = "04 85 96 05 10"            # EVA Lyon Sud
+DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
 
-# ── Token Discord : variable d'environnement ou config.txt (local) ─────────
-def load_token_from_config():
-    if not os.path.exists(CONFIG_FILE):
-        return None
-    with open(CONFIG_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("TOKEN="):
-                token = line.split("=", 1)[1].strip()
-                if token:
-                    return token
-    return None
+def lien_reservation(ts):
+    """Lien EVA Lyon Sud qui ouvre directement le calendrier au jour de la session."""
+    jour = datetime.fromtimestamp(ts, PARIS).strftime("%Y-%m-%d")
+    return (
+        "https://app.eva.gg/fr-FR/booking/calendar?locationId=52&gameIds=1&seatCount=1"
+        "&isCompetitiveMode=true&origin=%2Fbooking%3FlocationId%3D52%26gameIds%3D1"
+        f"%26seatCount%3D1%26isCompetitiveMode%3Dtrue&currentDate={jour}"
+    )
 
-TOKEN = os.environ.get("DISCORD_TOKEN") or load_token_from_config()
-
+# ═══════════════════════════════════════════════════════════════════════════
+#  Configuration (fichier .env sur le serveur)
+#    DISCORD_TOKEN  : token du bot (obligatoire)
+#    GITHUB_TOKEN + GITHUB_REPO : stockage sur GitHub (sinon fichier local)
+# ═══════════════════════════════════════════════════════════════════════════
+TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
-    print("=" * 50)
-    print("ERREUR : aucun token Discord trouvé.")
-    print("Serveur : ajoute DISCORD_TOKEN dans le fichier .env")
-    print("En local : mets TOKEN=ton_token dans config.txt")
-    print("=" * 50)
+    print("ERREUR : DISCORD_TOKEN manquant dans le fichier .env")
     sys.exit(1)
 
-# Serveur Discord de la team : la commande /orga n'apparaît que là
-TEAM_GUILD_ID = os.environ.get("TEAM_GUILD_ID", "").strip()
-TEAM_GUILD = discord.Object(id=int(TEAM_GUILD_ID)) if TEAM_GUILD_ID else None
-
-# ── Stockage : GitHub ou fichiers locaux ───────────────────────────────────
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")            # ex : "Gaurage/Bot-EVA-data"
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 USE_GITHUB = bool(GITHUB_TOKEN and GITHUB_REPO)
 
+FICHIER = "team_events.json"
+FICHIER_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), FICHIER)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Stockage des sessions : GitHub ou fichier local
+# ═══════════════════════════════════════════════════════════════════════════
 def _gh_headers():
-    return {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
 
-def _gh_url(filename):
-    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+def _gh_url():
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{FICHIER}"
 
-def github_load(filename):
-    """Lit un fichier JSON sur GitHub. Réessaie 3 fois ; si GitHub reste
-    injoignable, arrête le bot (il redémarre tout seul 30 s plus tard)
-    plutôt que de démarrer à vide et d'écraser les données."""
-    for essai in range(3):
+def github_load():
+    """Réessaie 3 fois ; si GitHub reste injoignable, arrête le bot (il redémarre
+    tout seul 30 s plus tard) plutôt que de démarrer à vide et d'écraser les données."""
+    for _ in range(3):
         try:
-            r = requests.get(_gh_url(filename), headers=_gh_headers(),
+            r = requests.get(_gh_url(), headers=_gh_headers(),
                              params={"ref": GITHUB_BRANCH}, timeout=15)
             if r.status_code == 200:
                 decoded = base64.b64decode(r.json()["content"]).decode("utf-8")
                 return json.loads(decoded) if decoded.strip() else {}
             if r.status_code == 404:
                 return {}
-            print(f"⚠️ GitHub load {filename} : {r.status_code} {r.text}")
+            print(f"⚠️ GitHub load : {r.status_code} {r.text}")
         except Exception as e:
-            print(f"⚠️ Erreur github_load {filename} : {e}")
+            print(f"⚠️ Erreur GitHub load : {e}")
         time.sleep(5)
-    print(f"❌ Impossible de lire {filename} sur GitHub : arrêt pour protéger les données")
+    print("❌ Impossible de lire les données sur GitHub : arrêt pour les protéger")
     sys.exit(1)
 
-def _github_write(filename, json_str):
+def github_write(json_str):
     try:
         sha = None
-        r = requests.get(_gh_url(filename), headers=_gh_headers(),
+        r = requests.get(_gh_url(), headers=_gh_headers(),
                          params={"ref": GITHUB_BRANCH}, timeout=15)
         if r.status_code == 200:
             sha = r.json()["sha"]
         payload = {
-            "message": f"update {filename}",
+            "message": f"update {FICHIER}",
             "content": base64.b64encode(json_str.encode("utf-8")).decode("utf-8"),
             "branch": GITHUB_BRANCH,
         }
         if sha:
             payload["sha"] = sha
-        r = requests.put(_gh_url(filename), headers=_gh_headers(),
-                         json=payload, timeout=15)
+        r = requests.put(_gh_url(), headers=_gh_headers(), json=payload, timeout=15)
         if r.status_code not in (200, 201):
-            print(f"⚠️ GitHub save {filename} : {r.status_code} {r.text}")
+            print(f"⚠️ GitHub save : {r.status_code} {r.text}")
     except Exception as e:
-        print(f"⚠️ Erreur github_write {filename} : {e}")
+        print(f"⚠️ Erreur GitHub save : {e}")
 
-# File d'attente : écrit sur GitHub dans l'ordre, sans bloquer le bot
+# File d'attente d'écriture : sauvegarde sur GitHub dans l'ordre, sans bloquer le bot
 _save_queue = queue.Queue()
 
 def _save_worker():
     while True:
-        filename, json_str = _save_queue.get()
-        _github_write(filename, json_str)
+        json_str = _save_queue.get()
+        github_write(json_str)
         _save_queue.task_done()
 
 if USE_GITHUB:
     threading.Thread(target=_save_worker, daemon=True).start()
 
-def _save(filename, local_path, data):
+def load_team_events():
     if USE_GITHUB:
-        _save_queue.put((filename, json.dumps(data, ensure_ascii=False)))
-    else:
-        with open(local_path, "w") as f:
-            json.dump(data, f)
-
-def _load(filename, local_path):
-    if USE_GITHUB:
-        return github_load(filename)
-    if os.path.exists(local_path):
-        with open(local_path, "r") as f:
+        return github_load()
+    if os.path.exists(FICHIER_LOCAL):
+        with open(FICHIER_LOCAL, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-# ── Bot ────────────────────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-def load_pseudos():
-    return _load("pseudos.json", PSEUDOS_FILE)
-
-def save_pseudos(pseudos):
-    _save("pseudos.json", PSEUDOS_FILE, pseudos)
-
-def load_team_events():
-    return _load("team_events.json", TEAM_EVENTS_FILE)
-
 def save_team_events():
-    _save("team_events.json", TEAM_EVENTS_FILE, team_events)
+    if USE_GITHUB:
+        _save_queue.put(json.dumps(team_events, ensure_ascii=False))
+    else:
+        with open(FICHIER_LOCAL, "w", encoding="utf-8") as f:
+            json.dump(team_events, f, ensure_ascii=False)
 
-def purge_old_team_events():
-    limite = datetime.now(timezone.utc).timestamp() - 30 * 24 * 3600
-    to_delete = [mid for mid, e in team_events.items() if e.get("start_ts", 0) < limite]
-    for mid in to_delete:
-        del team_events[mid]
-    if to_delete:
-        print(f"🗑️ {len(to_delete)} session(s) team purgée(s) (> 30 jours)")
-        save_team_events()
-
-pseudos_eva = load_pseudos()
 team_events = load_team_events()
 
-def pseudo_de(user):
-    return pseudos_eva.get(str(user.id), user.display_name)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Bot
+# ═══════════════════════════════════════════════════════════════════════════
+bot = discord.Client(intents=discord.Intents.default())
+tree = app_commands.CommandTree(bot)
 
 def joueur_lien(p):
     """Mention cliquable : affiche le pseudo du serveur et ouvre le profil Discord."""
@@ -177,12 +139,23 @@ def liste_champ(lignes, vide="_Personne pour l'instant_"):
     """Assemble des lignes sans dépasser la limite Discord (1024) ni couper un pseudo."""
     texte = ""
     for i, ligne in enumerate(lignes):
-        reste = len(lignes) - i
-        suite = f"\n… et {reste} autre(s)"
+        suite = f"\n… et {len(lignes) - i} autre(s)"
         if len(texte) + len(ligne) + 1 + len(suite) > 1024:
             return texte + suite
         texte += ("\n" if texte else "") + ligne
     return texte or vide
+
+def horaires_sessions(ev):
+    ts, n = ev["start_ts"], ev.get("nb_sessions", 1)
+    d = ev.get("duree", DUREE_SESSION)
+    return " · ".join(f"<t:{ts + i * d * 60}:t>" for i in range(n))
+
+async def envoyer_mp(user_id, embed):
+    try:
+        user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+        await user.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"⚠️ MP impossible à {user_id} (MP fermés ?) : {e}")
 
 async def creer_fil(msg, nom):
     """Crée un fil de discussion sous l'annonce. Renvoie l'id du fil ou None."""
@@ -193,20 +166,7 @@ async def creer_fil(msg, nom):
         print(f"⚠️ Fil impossible (permission 'Créer des fils publics' ?) : {e}")
         return None
 
-BOOKING_URL = "https://app.eva.gg/fr-FR/booking?locationId=52&gameIds=1&seatCount=1&isCompetitiveMode=true"
-
-def lien_reservation(ts):
-    """Lien EVA qui ouvre directement le calendrier au jour de la session."""
-    jour = datetime.fromtimestamp(ts, PARIS).strftime("%Y-%m-%d")
-    return (
-        "https://app.eva.gg/fr-FR/booking/calendar?locationId=52&gameIds=1&seatCount=1"
-        "&isCompetitiveMode=true&origin=%2Fbooking%3FlocationId%3D52%26gameIds%3D1"
-        f"%26seatCount%3D1%26isCompetitiveMode%3Dtrue&currentDate={jour}"
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  /orga : session interne de la team (une seule liste "Présents")
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Lecture de la date et de l'heure tapées dans /orga ──────────────────────
 MOIS_FR = {
     "janvier": 1, "janv": 1, "jan": 1,
     "fevrier": 2, "février": 2, "fevr": 2, "févr": 2, "fev": 2, "fév": 2,
@@ -222,6 +182,7 @@ MOIS_FR = {
     "decembre": 12, "décembre": 12, "dec": 12, "déc": 12,
 }
 JOURS_FR = {"lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"}
+JOURS_COURTS = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
 
 def parse_heure(heure_str):
     """'22:00', '22h00', '22h', '22', '22.30', '22 h 30' -> (h, m)"""
@@ -270,29 +231,28 @@ def parse_date_heure(date_str, heure_str):
         debut = debut.replace(year=now.year + 1)
     return debut
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Annonce et MP
+# ═══════════════════════════════════════════════════════════════════════════
 def build_team_embed(ev):
     ts = ev["start_ts"]
-    n = ev["nb_sessions"]
-    d = ev["duree"]
-    horaires = " · ".join(f"<t:{ts + i * d * 60}:t>" for i in range(n))
-    orga = f"<@{ev['organisateur_id']}>" if ev.get("organisateur_id") else ev["organisateur"]
-
+    n = ev.get("nb_sessions", 1)
+    d = ev.get("duree", DUREE_SESSION)
+    orga = f"<@{ev['organisateur_id']}>" if ev.get("organisateur_id") else ev.get("organisateur", "?")
     embed = discord.Embed(
         title=f"🎮 {ev['titre']}"[:256],
         description=(
             f"**Organisé par** {orga}\n\n"
             f"**Description**\n{ev['description'][:1000]}\n\n"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
-            f"**Sessions ({n} × {d}min)**\n{horaires}\n\n"
+            f"**Sessions ({n} × {d}min)**\n{horaires_sessions(ev)}\n\n"
             f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ts)})**"
         ),
         color=0x2ECC71
     )
-
     presents = ev["presents"]
-    places = ev.get("places", 8)
     embed.add_field(
-        name=f"✅ Inscrits ({len(presents)}/{places})",
+        name=f"✅ Inscrits ({len(presents)}/{ev.get('places', 8)})",
         value=liste_champ([f"{i}. {joueur_lien(p)}" for i, p in enumerate(presents, 1)]),
         inline=False
     )
@@ -302,24 +262,8 @@ def build_team_embed(ev):
             value=liste_champ([f"{i}. {joueur_lien(p)}" for i, p in enumerate(ev["attente"], 1)]),
             inline=False
         )
-    if ev["absents"]:
-        embed.add_field(
-            name="😴 Pas dispo",
-            value=liste_champ([f"• {joueur_lien(p)}" for p in ev["absents"]]),
-            inline=False
-        )
-    if ev["annules"]:
-        embed.add_field(
-            name="❌ Ne vient plus",
-            value=liste_champ([f"• {joueur_lien(p)}" for p in ev["annules"]]),
-            inline=False
-        )
     embed.set_footer(text="Clique sur un bouton pour répondre")
     return embed
-
-def retirer_team(ev, user_id):
-    for cle in ("presents", "attente", "absents", "annules"):
-        ev[cle] = [p for p in ev.get(cle, []) if p["id"] != user_id]
 
 async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
     ts = ev["start_ts"]
@@ -336,11 +280,29 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
         )[:4096],
         color=0x2ECC71
     )
-    try:
-        user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
-        await user.send(embed=embed)
-    except discord.HTTPException as e:
-        print(f"⚠️ DM impossible à {user_id} (MP fermés ?) : {e}")
+    await envoyer_mp(user_id, embed)
+
+async def envoyer_rappel(user_id, ev, lien_annonce):
+    n = ev.get("nb_sessions", 1)
+    description = (
+        f"🕙 {horaires_sessions(ev)} ({n} session{'s' if n > 1 else ''})\n\n"
+        f"🚗 **Un retard ? Appelle la salle : {TEL_SALLE}**"
+    )
+    if lien_annonce:
+        description += f"\n\n**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
+    embed = discord.Embed(
+        title=f"⏰ RAPPEL : Ta partie à EVA LYON SUD c'est dans 1h : {ev['titre']}"[:256],
+        description=description,
+        color=0xF1C40F
+    )
+    await envoyer_mp(user_id, embed)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Boutons : Présent / Sortir / File d'attente
+# ═══════════════════════════════════════════════════════════════════════════
+def retirer_team(ev, user_id):
+    for cle in ("presents", "attente"):
+        ev[cle] = [p for p in ev.get(cle, []) if p["id"] != user_id]
 
 class TeamView(discord.ui.View):
     def __init__(self):
@@ -353,7 +315,7 @@ class TeamView(discord.ui.View):
             return
         ev.setdefault("attente", [])
         user_id = str(interaction.user.id)
-        joueur = {"id": user_id, "pseudo": pseudo_de(interaction.user)}
+        joueur = {"id": user_id, "pseudo": interaction.user.display_name}
         places = ev.get("places", 8)
         inscrit = any(p["id"] == user_id for p in ev["presents"])
         en_attente = any(p["id"] == user_id for p in ev["attente"])
@@ -370,7 +332,8 @@ class TeamView(discord.ui.View):
                 ev["presents"].append(joueur)
             else:
                 ev["attente"].append(joueur)
-                info = f"⏳ Session complète : tu es en file d'attente (position {len(ev['attente'])}). Tu recevras un MP si une place se libère."
+                info = (f"⏳ Session complète : tu es en file d'attente (position {len(ev['attente'])}). "
+                        f"Tu recevras un MP si une place se libère.")
         else:  # Sortir
             retirer_team(ev, user_id)
             # Une place se libère : le 1er de la file d'attente la prend
@@ -386,9 +349,6 @@ class TeamView(discord.ui.View):
         # Session pleine : MP à chaque joueur qui ne l'a pas encore reçu
         if len(ev["presents"]) >= places:
             deja_prevenus = set(ev.get("dm_envoyes", []))
-            if ev.get("dm_complet") and not deja_prevenus:
-                # ancien format : les inscrits d'avant ont déjà été prévenus
-                deja_prevenus = {p["id"] for p in ev["presents"] if p["id"] != user_id}
             cibles = [p["id"] for p in ev["presents"] if p["id"] not in deja_prevenus]
             if promu and promu["id"] not in cibles:
                 cibles.append(promu["id"])
@@ -411,27 +371,17 @@ class TeamView(discord.ui.View):
     async def attente(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._repondre(interaction, "attente")
 
-class AncienBoutonView(discord.ui.View):
-    """Bouton "Je ne viens plus" des annonces publiées avant la mise à jour :
-    il agit comme "Sortir" et l'annonce passe aux nouveaux boutons."""
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="❌ Je ne viens plus", style=discord.ButtonStyle.danger, custom_id="team_leave")
-    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await TeamView()._repondre(interaction, None)
-
-DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
-DUREE_SESSION = 40  # une session EVA dure toujours 40 min
-
-@app_commands.command(name="orga", description="Créer une session EVA pour la team")
+# ═══════════════════════════════════════════════════════════════════════════
+#  Commande /orga
+# ═══════════════════════════════════════════════════════════════════════════
+@tree.command(name="orga", description="Créer une session EVA")
 @app_commands.describe(
     date="Choisis dans la liste ou tape JJ/MM (année en cours ajoutée)",
     heure="Heure de début (ex : 22, 22h, 22h10, 22:10, 22.10)",
-    sessions="Combien de sessions à partir de l'heure de début ?",
+    sessions="Combien de sessions de 40 min à la suite ?",
     description="Mix chill, Train, Split… ou tape ton propre texte",
     titre="Titre de l'annonce (défaut : Session EVA)",
-    places="Nombre de places, 10 max (défaut : 8)",
+    places=f"Nombre de places, {PLACES_MAX} max (défaut : 8)",
 )
 @app_commands.choices(sessions=[
     app_commands.Choice(name="1 session", value=1),
@@ -446,7 +396,7 @@ async def session_cmd(
     sessions: app_commands.Choice[int],
     description: str,
     titre: app_commands.Range[str, 1, 100] = "Session EVA",
-    places: app_commands.Range[int, 1, 10] = 8,
+    places: app_commands.Range[int, 1, PLACES_MAX] = 8,
 ):
     try:
         debut = parse_date_heure(date, heure)
@@ -465,39 +415,34 @@ async def session_cmd(
 
     ev = {
         "titre": titre,
-        "organisateur": pseudo_de(interaction.user),
         "organisateur_id": str(interaction.user.id),
         "description": description.strip()[:300] or "Mix chill",
         "start_ts": int(debut.timestamp()),
         "nb_sessions": sessions.value,
         "duree": DUREE_SESSION,
         "places": places,
+        "cree_ts": int(datetime.now(timezone.utc).timestamp()),
         "presents": [],
         "attente": [],
-        "absents": [],
-        "annules": [],
     }
     await interaction.response.send_message(embed=build_team_embed(ev), view=TeamView())
     msg = await interaction.original_response()
     ev["channel_id"] = msg.channel.id
+    ev["guild_id"] = msg.guild.id if msg.guild else None
     ev["thread_id"] = await creer_fil(msg, f"{titre} {debut.strftime('%d/%m/%Y %H:%M')}")
     team_events[str(msg.id)] = ev
     save_team_events()
 
-JOURS_COURTS = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
-
 @session_cmd.autocomplete("date")
 async def date_autocomplete(interaction: discord.Interaction, current: str):
-    """Pré-remplit la date : les 14 prochains jours, ou la date tapée complétée avec l'année."""
+    """Propose les 14 prochains jours, ou la date tapée complétée avec l'année."""
     tape = current.strip()
     options = []
-
     if tape:
         try:
             jour, mois, annee = parse_date(tape)
             if annee is None:
-                debut = parse_date_heure(tape, "0")
-                annee = debut.year
+                annee = parse_date_heure(tape, "0").year
             d = datetime(annee, mois, jour)
             valeur = d.strftime("%d/%m/%Y")
             options.append(app_commands.Choice(name=f"{JOURS_COURTS[d.weekday()]} {valeur}", value=valeur))
@@ -523,18 +468,47 @@ async def date_autocomplete(interaction: discord.Interaction, current: str):
 async def description_autocomplete(interaction: discord.Interaction, current: str):
     """Propose les présets, et garde ce que l'utilisateur tape comme choix libre."""
     tape = current.strip()
-    choix = [p for p in DESCRIPTIONS_PRESETS if tape.lower() in p.lower()]
-    options = [app_commands.Choice(name=p, value=p) for p in choix]
+    options = [app_commands.Choice(name=p, value=p)
+               for p in DESCRIPTIONS_PRESETS if tape.lower() in p.lower()]
     if tape and tape.lower() not in [p.lower() for p in DESCRIPTIONS_PRESETS]:
         options.append(app_commands.Choice(name=f"✏️ {tape}"[:100], value=tape[:100]))
     return options[:25]
 
-if TEAM_GUILD:
-    bot.tree.add_command(session_cmd, guild=TEAM_GUILD)
-else:
-    bot.tree.add_command(session_cmd)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Tâches automatiques : rappel 1h avant + nettoyage J+1
+# ═══════════════════════════════════════════════════════════════════════════
+async def lien_de_annonce(mid, ev):
+    guild_id = ev.get("guild_id")
+    if not guild_id and ev.get("channel_id"):
+        try:
+            salon = bot.get_channel(ev["channel_id"]) or await bot.fetch_channel(ev["channel_id"])
+            guild_id = salon.guild.id
+        except Exception:
+            return None
+    if guild_id and ev.get("channel_id"):
+        return f"https://discord.com/channels/{guild_id}/{ev['channel_id']}/{mid}"
+    return None
 
-# ── Nettoyage J+1 : annonce + fil supprimés 24h après la fin de la session ──
+@tasks.loop(minutes=1)
+async def rappels_1h():
+    """MP de rappel aux inscrits 1h avant le début (une seule fois)."""
+    maintenant = datetime.now(timezone.utc).timestamp()
+    for mid, ev in list(team_events.items()):
+        try:
+            debut = ev["start_ts"]
+            if ev.get("rappel_envoye") or not (debut - 3600 <= maintenant < debut):
+                continue
+            ev["rappel_envoye"] = True
+            save_team_events()
+            if ev.get("cree_ts", 0) > debut - 3600:
+                continue  # session créée moins d'1h avant : pas de rappel
+            lien = await lien_de_annonce(mid, ev)
+            for p in ev.get("presents", []):
+                await envoyer_rappel(p["id"], ev, lien)
+            print(f"⏰ Rappel envoyé pour la session {mid} ({len(ev.get('presents', []))} joueur(s))")
+        except Exception as e:
+            print(f"⚠️ Rappel session {mid} : {e}")
+
 async def supprimer_salon_ou_message(channel_id, message_id=None):
     try:
         salon = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
@@ -550,12 +524,12 @@ async def supprimer_salon_ou_message(channel_id, message_id=None):
 
 @tasks.loop(minutes=30)
 async def nettoyage_j1():
-    """Ne s'arrête jamais : une erreur sur une session n'empêche pas les autres."""
+    """Supprime l'annonce et son fil 24h après la fin de la session."""
     maintenant = datetime.now(timezone.utc).timestamp()
     a_supprimer = []
     for mid, ev in list(team_events.items()):
         try:
-            fin = ev["start_ts"] + ev.get("nb_sessions", 1) * ev.get("duree", 40) * 60
+            fin = ev["start_ts"] + ev.get("nb_sessions", 1) * ev.get("duree", DUREE_SESSION) * 60
             if maintenant > fin + 24 * 3600:
                 a_supprimer.append(mid)
         except Exception as e:
@@ -574,7 +548,9 @@ async def nettoyage_j1():
         print(f"🧹 {len(a_supprimer)} session(s) supprimée(s) (J+1)")
         save_team_events()
 
-# ── Démarrage ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  Démarrage
+# ═══════════════════════════════════════════════════════════════════════════
 _deja_pret = False
 
 @bot.event
@@ -584,44 +560,14 @@ async def on_ready():
         return
     _deja_pret = True
 
-    await bot.tree.sync()
-    if TEAM_GUILD:
-        try:
-            await bot.tree.sync(guild=TEAM_GUILD)
-        except discord.HTTPException as e:
-            print(f"⚠️ Sync serveur team impossible (bot pas invité ?) : {e}")
-    else:
-        # Supprime les anciennes /orga réservées à un serveur (évite les doublons)
-        for g in bot.guilds:
-            try:
-                await bot.tree.sync(guild=g)
-            except discord.HTTPException:
-                pass
-
-    purge_old_team_events()
+    await tree.sync()
     bot.add_view(TeamView())
-    bot.add_view(AncienBoutonView())
     if not nettoyage_j1.is_running():
         nettoyage_j1.start()
+    if not rappels_1h.is_running():
+        rappels_1h.start()
     print(f"✅ Bot EVA connecté : {bot.user}")
-    print(f"💾 Stockage : {'GitHub (' + GITHUB_REPO + ')' if USE_GITHUB else 'fichiers locaux'}")
-    print(f"📋 Pseudos chargés : {len(pseudos_eva)} joueur(s)")
-    print(f"🎮 Sessions team actives : {len(team_events)}")
-    print(f"🏠 Serveur team : {TEAM_GUILD_ID or 'non défini (/orga partout)'}")
+    print(f"💾 Stockage : {'GitHub (' + GITHUB_REPO + ')' if USE_GITHUB else 'fichier local'}")
+    print(f"🎮 Sessions actives : {len(team_events)}")
 
-# ── Mini serveur web (inutile sur Google Cloud, sans effet) ────────────────
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot EVA en ligne ✅"
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-def keep_alive():
-    threading.Thread(target=run_web, daemon=True).start()
-
-keep_alive()
 bot.run(TOKEN)
