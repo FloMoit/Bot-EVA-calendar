@@ -58,15 +58,20 @@ def _gh_headers():
 def _gh_url():
     return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{FICHIER}"
 
+_sha = None  # version du fichier sur GitHub (évite une lecture avant chaque sauvegarde)
+
 def github_load():
     """Réessaie 3 fois ; si GitHub reste injoignable, arrête le bot (il redémarre
     tout seul 30 s plus tard) plutôt que de démarrer à vide et d'écraser les données."""
+    global _sha
     for _ in range(3):
         try:
             r = requests.get(_gh_url(), headers=_gh_headers(),
                              params={"ref": GITHUB_BRANCH}, timeout=15)
             if r.status_code == 200:
-                decoded = base64.b64decode(r.json()["content"]).decode("utf-8")
+                data = r.json()
+                _sha = data["sha"]
+                decoded = base64.b64decode(data["content"]).decode("utf-8")
                 return json.loads(decoded) if decoded.strip() else {}
             if r.status_code == 404:
                 return {}
@@ -77,34 +82,43 @@ def github_load():
     print("❌ Impossible de lire les données sur GitHub : arrêt pour les protéger")
     sys.exit(1)
 
-def github_write(json_str):
-    try:
-        sha = None
-        r = requests.get(_gh_url(), headers=_gh_headers(),
-                         params={"ref": GITHUB_BRANCH}, timeout=15)
-        if r.status_code == 200:
-            sha = r.json()["sha"]
-        payload = {
-            "message": f"update {FICHIER}",
-            "content": base64.b64encode(json_str.encode("utf-8")).decode("utf-8"),
-            "branch": GITHUB_BRANCH,
-        }
-        if sha:
-            payload["sha"] = sha
-        r = requests.put(_gh_url(), headers=_gh_headers(), json=payload, timeout=15)
-        if r.status_code not in (200, 201):
-            print(f"⚠️ GitHub save : {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"⚠️ Erreur GitHub save : {e}")
+def _lire_sha():
+    r = requests.get(_gh_url(), headers=_gh_headers(),
+                     params={"ref": GITHUB_BRANCH}, timeout=15)
+    return r.json()["sha"] if r.status_code == 200 else None
 
-# File d'attente d'écriture : sauvegarde sur GitHub dans l'ordre, sans bloquer le bot
+def github_write(json_str):
+    """Une seule requête par sauvegarde ; relit la version seulement en cas de conflit."""
+    global _sha
+    contenu = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+    for _ in range(2):
+        try:
+            payload = {"message": f"update {FICHIER}", "content": contenu, "branch": GITHUB_BRANCH}
+            if _sha:
+                payload["sha"] = _sha
+            r = requests.put(_gh_url(), headers=_gh_headers(), json=payload, timeout=15)
+            if r.status_code in (200, 201):
+                _sha = r.json()["content"]["sha"]
+                return
+            if r.status_code in (409, 422):   # version périmée : on la relit et on réessaie
+                _sha = _lire_sha()
+                continue
+            print(f"⚠️ GitHub save : {r.status_code} {r.text}")
+            return
+        except Exception as e:
+            print(f"⚠️ Erreur GitHub save : {e}")
+            return
+
+# Sauvegarde en arrière-plan : si plusieurs sauvegardes arrivent d'un coup
+# (plusieurs clics), seule la plus récente est envoyée à GitHub.
 _save_queue = queue.Queue()
 
 def _save_worker():
     while True:
         json_str = _save_queue.get()
+        while not _save_queue.empty():   # on saute les versions déjà dépassées
+            json_str = _save_queue.get_nowait()
         github_write(json_str)
-        _save_queue.task_done()
 
 if USE_GITHUB:
     threading.Thread(target=_save_worker, daemon=True).start()
@@ -576,7 +590,7 @@ REPONSES_MP = [
 ]
 AIDE_MP = ("❓ Une question ? Contacte les **Game Masters** sur le Discord d'EVA Lyon Sud, "
            f"ou appelle la salle : **{TEL_SALLE}**")
-DEJA_AIDE = set()      # personnes qui ont déjà reçu le message d'aide
+DEJA_AIDE = {}         # dernier jour où chaque personne a reçu le message d'aide
 PAQUETS = {}           # phrases restantes à envoyer, par personne
 
 def prochaine_phrase(uid):
@@ -594,8 +608,9 @@ async def on_message(message):
         return  # on ne répond qu'aux MP envoyés par des humains
     uid = message.author.id
     texte = prochaine_phrase(uid)
-    if uid not in DEJA_AIDE:
-        DEJA_AIDE.add(uid)
+    aujourd_hui = datetime.now(PARIS).date()
+    if DEJA_AIDE.get(uid) != aujourd_hui:
+        DEJA_AIDE[uid] = aujourd_hui  # l'aide revient au 1er MP de chaque journée
         texte += f"\n\n{AIDE_MP}"
     try:
         await message.channel.send(texte)
