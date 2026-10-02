@@ -577,17 +577,23 @@ REPONSES_MP = [
 AIDE_MP = ("❓ Une question ? Contacte les **Game Masters** sur le Discord d'EVA Lyon Sud, "
            f"ou appelle la salle : **{TEL_SALLE}**")
 DEJA_AIDE = set()      # personnes qui ont déjà reçu le message d'aide
-DERNIERE_PHRASE = {}   # pour ne pas répéter deux fois de suite la même phrase
+PAQUETS = {}           # phrases restantes à envoyer, par personne
+
+def prochaine_phrase(uid):
+    """Les 19 premières phrases dans un ordre aléatoire, puis la dernière (🏆) en 20e.
+    Une fois les 20 envoyées, on remélange et on recommence."""
+    if not PAQUETS.get(uid):
+        paquet = REPONSES_MP[:-1]
+        random.shuffle(paquet)
+        PAQUETS[uid] = paquet + [REPONSES_MP[-1]]
+    return PAQUETS[uid].pop(0)
 
 @bot.event
 async def on_message(message):
     if message.author.bot or message.guild is not None:
         return  # on ne répond qu'aux MP envoyés par des humains
     uid = message.author.id
-    choix = [p for p in REPONSES_MP if p != DERNIERE_PHRASE.get(uid)]
-    phrase = random.choice(choix)
-    DERNIERE_PHRASE[uid] = phrase
-    texte = phrase
+    texte = prochaine_phrase(uid)
     if uid not in DEJA_AIDE:
         DEJA_AIDE.add(uid)
         texte += f"\n\n{AIDE_MP}"
