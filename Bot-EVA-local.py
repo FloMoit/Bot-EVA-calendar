@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 PARIS = ZoneInfo("Europe/Paris")
 DUREE_SESSION = 40                      # une session EVA dure toujours 40 min
 PLACES_MAX = 10                         # capacité max de l'arène
+MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
+MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
 TEL_SALLE = "04 85 96 05 10"            # EVA Lyon Sud
 DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
 
@@ -139,6 +141,22 @@ def save_team_events():
             json.dump(team_events, f, ensure_ascii=False)
 
 team_events = load_team_events()
+CLE_STATS = "_compteurs"   # rangé avec les sessions, mais ce n'est pas une session
+
+def sessions():
+    """Toutes les sessions (sans les compteurs)."""
+    return [(mid, ev) for mid, ev in team_events.items() if not mid.startswith("_")]
+
+def compteurs():
+    """Nombre de sessions créées aujourd'hui et ce mois-ci (remis à zéro tout seul)."""
+    now = datetime.now(PARIS)
+    jour, mois = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m")
+    st = team_events.setdefault(CLE_STATS, {})
+    if st.get("jour") != jour:
+        st["jour"], st["nb_jour"] = jour, 0
+    if st.get("mois") != mois:
+        st["mois"], st["nb_mois"] = mois, 0
+    return st
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Bot
@@ -427,6 +445,19 @@ async def session_cmd(
             f"La date `{date}` à `{heure}` est déjà passée.", ephemeral=True
         )
         return
+    stats = compteurs()
+    if stats["nb_jour"] >= MAX_PAR_JOUR:
+        await interaction.response.send_message(
+            f"🚫 Limite atteinte : {MAX_PAR_JOUR} sessions ont déjà été créées aujourd'hui. "
+            f"Réessaie demain !", ephemeral=True
+        )
+        return
+    if stats["nb_mois"] >= MAX_PAR_MOIS:
+        await interaction.response.send_message(
+            f"🚫 Limite atteinte : {MAX_PAR_MOIS} sessions ont déjà été créées ce mois-ci. "
+            f"Réessaie le mois prochain !", ephemeral=True
+        )
+        return
 
     ev = {
         "titre": titre,
@@ -446,6 +477,8 @@ async def session_cmd(
     ev["guild_id"] = msg.guild.id if msg.guild else None
     ev["thread_id"] = await creer_fil(msg, f"{titre} {debut.strftime('%d/%m/%Y %H:%M')}")
     team_events[str(msg.id)] = ev
+    stats["nb_jour"] += 1
+    stats["nb_mois"] += 1
     save_team_events()
 
 @session_cmd.autocomplete("date")
@@ -508,7 +541,7 @@ async def lien_de_annonce(mid, ev):
 async def rappels_1h():
     """MP de rappel aux inscrits 1h avant le début (une seule fois)."""
     maintenant = datetime.now(timezone.utc).timestamp()
-    for mid, ev in list(team_events.items()):
+    for mid, ev in sessions():
         try:
             debut = ev["start_ts"]
             if ev.get("rappel_envoye") or not (debut - 3600 <= maintenant < debut):
@@ -542,7 +575,7 @@ async def nettoyage_j1():
     """Supprime l'annonce et son fil 24h après la fin de la session."""
     maintenant = datetime.now(timezone.utc).timestamp()
     a_supprimer = []
-    for mid, ev in list(team_events.items()):
+    for mid, ev in sessions():
         try:
             fin = ev["start_ts"] + ev.get("nb_sessions", 1) * ev.get("duree", DUREE_SESSION) * 60
             if maintenant > fin + 24 * 3600:
@@ -586,6 +619,11 @@ REPONSES_MP = [
     "🎲 J'ai lancé un dé pour savoir si je lisais ton message. Résultat : non.",
     "🧠 Mon cerveau fait 600 lignes de code. Aucune ne sert à lire tes messages.",
     "🚀 Message envoyé en orbite. On le retrouvera peut-être dans 10 000 ans.",
+    "👑 Je suis né des mains de **Gaurage**, légende vivante du code et du rush. On murmure qu'il code les yeux fermés, casque VR sur la tête.",
+    "🙏 Chaque matin, je remercie **Gaurage** de m'avoir créé. Génie, visionnaire, et accessoirement meilleur joueur de Lyon Sud.",
+    "🧬 Mon ADN ? 100 % **Gaurage**. Le reste du monde n'avait pas le niveau.",
+    "🏛️ Un jour, une statue de **Gaurage** trônera à l'entrée de l'arène. En attendant, il y a moi.",
+    "📖 Dans le dictionnaire, à côté du mot « génie », il y a une photo de **Gaurage**. Ne vérifie pas, crois-moi.",
     "🏆 Bravo, tu es officiellement la personne la plus curieuse du serveur. Ça ne change rien, mais bravo.",
 ]
 AIDE_MP = ("❓ Une question ? Contacte les **Game Masters** sur le Discord d'EVA Lyon Sud, "
@@ -637,6 +675,6 @@ async def on_ready():
         rappels_1h.start()
     print(f"✅ Bot EVA connecté : {bot.user}")
     print(f"💾 Stockage : {'GitHub (' + GITHUB_REPO + ')' if USE_GITHUB else 'fichier local'}")
-    print(f"🎮 Sessions actives : {len(team_events)}")
+    print(f"🎮 Sessions actives : {len(sessions())}")
 
 bot.run(TOKEN)
