@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ext import tasks
 import json
 import os
+import random
 import sys
 import queue
 import base64
@@ -547,6 +548,53 @@ async def nettoyage_j1():
     if a_supprimer:
         print(f"🧹 {len(a_supprimer)} session(s) supprimée(s) (J+1)")
         save_team_events()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Réponse automatique quand quelqu'un écrit au bot en MP
+# ═══════════════════════════════════════════════════════════════════════════
+REPONSES_MP = [
+    "🤖 Bip boup… Je suis un bot, je ne sais que compter jusqu'à 10 joueurs. Personne ne lit ce message !",
+    "📭 Ton message vient de partir dans le vide intersidéral. Personne ne lit les MP du bot 👀",
+    "🥽 Désolé, je suis en pleine partie dans l'arène, je ne lis pas mes messages.",
+    "🎯 Joli tir, mais tu as visé le bot ! Aucun point marqué.",
+    "🛡️ Message bloqué derrière un mur. Comme toi au dernier round.",
+    "⚡ Tu rushes le bot ? Mauvaise idée, je ne respawn jamais.",
+    "📡 Connexion établie… avec personne. Ce message finira dans le néant.",
+    "🔋 Ma batterie de lecture est à 0 %. Depuis toujours.",
+    "🎮 Tu viens de débloquer le succès : « Parler à un robot ». Récompense : rien.",
+    "🧱 Tu parles à un mur. Un mur très bien codé, mais un mur.",
+    "🕶️ Je lirais bien ton message, mais j'ai encore mon casque VR sur la tête.",
+    "💥 Headshot ! Ah non, c'était juste un MP.",
+    "🏃 Je cours trop vite pour lire les messages. C'est ça, être un bot de rush.",
+    "📜 Ton message a été transmis au Game Master imaginaire. Il ne répond jamais.",
+    "🔁 Tu peux réessayer autant que tu veux, je suis programmé pour ne rien comprendre.",
+    "🤫 Chut… le bot fait la sieste entre deux sessions.",
+    "🎲 J'ai lancé un dé pour savoir si je lisais ton message. Résultat : non.",
+    "🧠 Mon cerveau fait 600 lignes de code. Aucune ne sert à lire tes messages.",
+    "🚀 Message envoyé en orbite. On le retrouvera peut-être dans 10 000 ans.",
+    "🏆 Bravo, tu es officiellement la personne la plus curieuse du serveur. Ça ne change rien, mais bravo.",
+]
+AIDE_MP = ("❓ Une question ? Contacte les **Game Masters** sur le Discord d'EVA Lyon Sud, "
+           f"ou appelle la salle : **{TEL_SALLE}**")
+DEJA_AIDE = set()      # personnes qui ont déjà reçu le message d'aide
+DERNIERE_PHRASE = {}   # pour ne pas répéter deux fois de suite la même phrase
+
+@bot.event
+async def on_message(message):
+    if message.author.bot or message.guild is not None:
+        return  # on ne répond qu'aux MP envoyés par des humains
+    uid = message.author.id
+    choix = [p for p in REPONSES_MP if p != DERNIERE_PHRASE.get(uid)]
+    phrase = random.choice(choix)
+    DERNIERE_PHRASE[uid] = phrase
+    texte = phrase
+    if uid not in DEJA_AIDE:
+        DEJA_AIDE.add(uid)
+        texte += f"\n\n{AIDE_MP}"
+    try:
+        await message.channel.send(texte)
+    except discord.HTTPException:
+        pass
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Démarrage
