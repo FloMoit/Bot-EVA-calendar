@@ -1,8 +1,5 @@
-config.txt
-events.json
-pseudos.json
+.env
+team_events.json
 __pycache__/
 *.pyc
-build/
-dist/
-*.spec
+venv/
