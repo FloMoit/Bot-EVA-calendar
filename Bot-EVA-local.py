@@ -22,7 +22,7 @@ DUREE_SESSION = 40                      # une session EVA dure toujours 40 min
 PLACES_MAX = 10                         # capacité max de l'arène
 MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
 MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
-PLACES_DEFAUT = 8                       # si la salle n'a rien choisi dans /config
+PLACES_DEFAUT = 8                       # places par défaut dans /orga (modifiable à chaque fois)
 DESCRIPTIONS_DEFAUT = ["Mix chill", "Train", "Split"]
 # Le nom de la salle, son téléphone et son identifiant EVA se règlent
 # directement sur Discord avec /config (réservé aux admins du serveur).
@@ -289,11 +289,13 @@ def build_team_embed(ev):
     n = ev.get("nb_sessions", 1)
     d = ev.get("duree", DUREE_SESSION)
     orga = f"<@{ev['organisateur_id']}>" if ev.get("organisateur_id") else ev.get("organisateur", "?")
+    # La description est déjà dans le titre ; on ne la répète que pour les anciennes annonces
+    bloc_desc = "" if ev["titre"].startswith(ev["description"]) else f"**Description**\n{ev['description'][:1000]}\n\n"
     embed = discord.Embed(
         title=f"🎮 {ev['titre']}"[:256],
         description=(
             f"**Organisé par** {orga}\n\n"
-            f"**Description**\n{ev['description'][:1000]}\n\n"
+            f"{bloc_desc}"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires_sessions(ev)}\n\n"
             f"{ligne_reservation(ev)}"
@@ -318,8 +320,9 @@ def build_team_embed(ev):
 async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
     ts = ev["start_ts"]
     joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
-    titre = (f"🎉 Une place s'est libérée, tu es inscrit : {ev['titre']}" if promu
-             else f"✅ Session complète pour EVA : {ev['titre']}")
+    nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
+    titre = (f"🎉 Une place s'est libérée à {nom}, tu es inscrit : {ev['titre']}" if promu
+             else f"✅ Session complète pour {nom} : {ev['titre']}")
     embed = discord.Embed(
         title=titre[:256],
         description=(
@@ -342,7 +345,7 @@ async def envoyer_rappel(user_id, ev, lien_annonce):
     if lien_annonce:
         description += f"\n\n**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
     embed = discord.Embed(
-        title=f"⏰ RAPPEL : Ta partie à {nom.upper()} c'est dans 1h : {ev['titre']}"[:256],
+        title=f"⏰ RAPPEL : Ta partie à {nom.upper()} c'est dans 1h : {ev.get('description', ev['titre'])}"[:256],
         description=description,
         color=0xF1C40F
     )
@@ -431,8 +434,7 @@ class TeamView(discord.ui.View):
     heure="Heure de début (ex : 22, 22h, 22h10, 22:10, 22.10)",
     sessions="Combien de sessions de 40 min à la suite ?",
     description="Mix chill, Train, Split… ou tape ton propre texte",
-    titre="Titre de l'annonce (défaut : Session EVA)",
-    places=f"Nombre de places, {PLACES_MAX} max (défaut : réglé par la salle)",
+    places=f"Nombre de places, {PLACES_MAX} max (défaut : {PLACES_DEFAUT})",
 )
 @app_commands.choices(sessions=[
     app_commands.Choice(name="1 session", value=1),
@@ -446,8 +448,7 @@ async def session_cmd(
     heure: str,
     sessions: app_commands.Choice[int],
     description: str,
-    titre: app_commands.Range[str, 1, 100] = "Session EVA",
-    places: app_commands.Range[int, 1, PLACES_MAX] = None,
+    places: app_commands.Range[int, 1, PLACES_MAX] = PLACES_DEFAUT,
 ):
     cfg = config_de(interaction.guild_id)
     if not cfg:
@@ -456,8 +457,6 @@ async def session_cmd(
             ephemeral=True
         )
         return
-    if places is None:
-        places = cfg.get("places_defaut", PLACES_DEFAUT)
     try:
         debut = parse_date_heure(date, heure)
     except ValueError:
@@ -486,10 +485,11 @@ async def session_cmd(
         )
         return
 
+    desc = description.strip()[:100] or "Mix chill"
     ev = {
-        "titre": titre,
+        "titre": f"{desc} · {debut.strftime('%H:%M')}",
         "organisateur_id": str(interaction.user.id),
-        "description": description.strip()[:300] or "Mix chill",
+        "description": desc,
         "start_ts": int(debut.timestamp()),
         "nb_sessions": sessions.value,
         "duree": DUREE_SESSION,
@@ -502,7 +502,7 @@ async def session_cmd(
     await interaction.response.send_message(embed=build_team_embed(ev), view=TeamView())
     msg = await interaction.original_response()
     ev["channel_id"] = msg.channel.id
-    ev["thread_id"] = await creer_fil(msg, f"{titre} {debut.strftime('%d/%m/%Y %H:%M')}")
+    ev["thread_id"] = await creer_fil(msg, f"{desc[:80]} {debut.strftime('%d/%m/%Y %H:%M')}")
     team_events[str(msg.id)] = ev
     stats["nb_jour"] += 1
     stats["nb_mois"] += 1
@@ -573,7 +573,6 @@ def lire_location_id(lien):
     telephone="Numéro de la salle (ex : 04 85 96 05 10)",
     lien="Colle un lien de réservation EVA de la salle (ou juste son numéro, ex : 52)",
     descriptions="Descriptions proposées, séparées par des virgules (défaut : Mix chill, Train, Split)",
-    places_defaut=f"Places par défaut dans /orga, {PLACES_MAX} max (défaut : {PLACES_DEFAUT})",
 )
 async def config_cmd(
     interaction: discord.Interaction,
@@ -581,7 +580,6 @@ async def config_cmd(
     telephone: app_commands.Range[str, 4, 30],
     lien: str,
     descriptions: app_commands.Range[str, 1, 300] = None,
-    places_defaut: app_commands.Range[int, 1, PLACES_MAX] = None,
 ):
     # Double sécurité : même si un admin rend /config visible à d'autres,
     # seuls ceux qui ont la permission « Gérer le serveur » peuvent l'utiliser.
@@ -610,7 +608,6 @@ async def config_cmd(
         "telephone": telephone.strip(),
         "location_id": location_id,
         "descriptions": liste or DESCRIPTIONS_DEFAUT,
-        "places_defaut": places_defaut or ancien.get("places_defaut", PLACES_DEFAUT),
     }
     team_events[cle] = cfg
     save_team_events()
@@ -621,7 +618,7 @@ async def config_cmd(
         f"• Téléphone : **{cfg['telephone']}**\n"
         f"• Réservation : [calendrier de la salle (identifiant {location_id})](<{test}>)\n"
         f"• Descriptions proposées : {', '.join(cfg['descriptions'])}\n"
-        f"• Places par défaut : {cfg['places_defaut']}\n\n"
+        "\n"
         "Clique sur le lien pour vérifier qu'il ouvre bien ta salle. "
         "Tu peux relancer `/config` à tout moment pour modifier.",
         ephemeral=True
