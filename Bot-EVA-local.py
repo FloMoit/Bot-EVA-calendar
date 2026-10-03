@@ -4,6 +4,7 @@ from discord.ext import tasks
 import json
 import os
 import random
+import re
 import sys
 import queue
 import base64
@@ -21,15 +22,17 @@ DUREE_SESSION = 40                      # une session EVA dure toujours 40 min
 PLACES_MAX = 10                         # capacité max de l'arène
 MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
 MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
-TEL_SALLE = "04 85 96 05 10"            # EVA Lyon Sud
-DESCRIPTIONS_PRESETS = ["Mix chill", "Train", "Split"]
+PLACES_DEFAUT = 8                       # si la salle n'a rien choisi dans /config
+DESCRIPTIONS_DEFAUT = ["Mix chill", "Train", "Split"]
+# Le nom de la salle, son téléphone et son identifiant EVA se règlent
+# directement sur Discord avec /config (réservé aux admins du serveur).
 
-def lien_reservation(ts):
-    """Lien EVA Lyon Sud qui ouvre directement le calendrier au jour de la session."""
+def lien_reservation(ts, location_id):
+    """Lien EVA qui ouvre directement le calendrier de la salle au jour de la session."""
     jour = datetime.fromtimestamp(ts, PARIS).strftime("%Y-%m-%d")
     return (
-        "https://app.eva.gg/fr-FR/booking/calendar?locationId=52&gameIds=1&seatCount=1"
-        "&isCompetitiveMode=true&origin=%2Fbooking%3FlocationId%3D52%26gameIds%3D1"
+        f"https://app.eva.gg/fr-FR/booking/calendar?locationId={location_id}&gameIds=1&seatCount=1"
+        f"&isCompetitiveMode=true&origin=%2Fbooking%3FlocationId%3D{location_id}%26gameIds%3D1"
         f"%26seatCount%3D1%26isCompetitiveMode%3Dtrue&currentDate={jour}"
     )
 
@@ -146,6 +149,14 @@ CLE_STATS = "_compteurs"   # rangé avec les sessions, mais ce n'est pas une ses
 def sessions():
     """Toutes les sessions (sans les compteurs)."""
     return [(mid, ev) for mid, ev in team_events.items() if not mid.startswith("_")]
+
+def config_de(guild_id):
+    """Réglages de la salle enregistrés avec /config pour ce serveur (ou None).
+    Sans serveur connu (anciennes sessions) : la config s'il n'y en a qu'une."""
+    if guild_id:
+        return team_events.get(f"_config_{guild_id}")
+    configs = [v for k, v in team_events.items() if k.startswith("_config_")]
+    return configs[0] if len(configs) == 1 else None
 
 def compteurs():
     """Nombre de sessions créées aujourd'hui et ce mois-ci (remis à zéro tout seul)."""
@@ -267,6 +278,12 @@ def parse_date_heure(date_str, heure_str):
 # ═══════════════════════════════════════════════════════════════════════════
 #  Annonce et MP
 # ═══════════════════════════════════════════════════════════════════════════
+def ligne_reservation(ev):
+    cfg = config_de(ev.get("guild_id"))
+    if not cfg:
+        return ""
+    return f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ev['start_ts'], cfg['location_id'])})**"
+
 def build_team_embed(ev):
     ts = ev["start_ts"]
     n = ev.get("nb_sessions", 1)
@@ -279,8 +296,8 @@ def build_team_embed(ev):
             f"**Description**\n{ev['description'][:1000]}\n\n"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires_sessions(ev)}\n\n"
-            f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ts)})**"
-        ),
+            f"{ligne_reservation(ev)}"
+        ).strip(),
         color=0x2ECC71
     )
     presents = ev["presents"]
@@ -308,7 +325,7 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
         description=(
             f"📅 <t:{ts}:F>\n\n"
             f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
-            f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ts)})**\n\n"
+            f"{ligne_reservation(ev)}\n\n"
             f"**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
         )[:4096],
         color=0x2ECC71
@@ -317,14 +334,15 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
 
 async def envoyer_rappel(user_id, ev, lien_annonce):
     n = ev.get("nb_sessions", 1)
-    description = (
-        f"🕙 {horaires_sessions(ev)} ({n} session{'s' if n > 1 else ''})\n\n"
-        f"🚗 **Un retard ? Appelle la salle : {TEL_SALLE}**"
-    )
+    cfg = config_de(ev.get("guild_id")) or {}
+    nom = cfg.get("nom", "EVA")
+    description = f"🕙 {horaires_sessions(ev)} ({n} session{'s' if n > 1 else ''})"
+    if cfg.get("telephone"):
+        description += f"\n\n🚗 **Un retard ? Appelle la salle : {cfg['telephone']}**"
     if lien_annonce:
         description += f"\n\n**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
     embed = discord.Embed(
-        title=f"⏰ RAPPEL : Ta partie à EVA LYON SUD c'est dans 1h : {ev['titre']}"[:256],
+        title=f"⏰ RAPPEL : Ta partie à {nom.upper()} c'est dans 1h : {ev['titre']}"[:256],
         description=description,
         color=0xF1C40F
     )
@@ -414,7 +432,7 @@ class TeamView(discord.ui.View):
     sessions="Combien de sessions de 40 min à la suite ?",
     description="Mix chill, Train, Split… ou tape ton propre texte",
     titre="Titre de l'annonce (défaut : Session EVA)",
-    places=f"Nombre de places, {PLACES_MAX} max (défaut : 8)",
+    places=f"Nombre de places, {PLACES_MAX} max (défaut : réglé par la salle)",
 )
 @app_commands.choices(sessions=[
     app_commands.Choice(name="1 session", value=1),
@@ -429,8 +447,17 @@ async def session_cmd(
     sessions: app_commands.Choice[int],
     description: str,
     titre: app_commands.Range[str, 1, 100] = "Session EVA",
-    places: app_commands.Range[int, 1, PLACES_MAX] = 8,
+    places: app_commands.Range[int, 1, PLACES_MAX] = None,
 ):
+    cfg = config_de(interaction.guild_id)
+    if not cfg:
+        await interaction.response.send_message(
+            "⚙️ Le bot n'est pas encore configuré sur ce serveur : un admin doit lancer `/config`.",
+            ephemeral=True
+        )
+        return
+    if places is None:
+        places = cfg.get("places_defaut", PLACES_DEFAUT)
     try:
         debut = parse_date_heure(date, heure)
     except ValueError:
@@ -470,11 +497,11 @@ async def session_cmd(
         "cree_ts": int(datetime.now(timezone.utc).timestamp()),
         "presents": [],
         "attente": [],
+        "guild_id": interaction.guild_id,
     }
     await interaction.response.send_message(embed=build_team_embed(ev), view=TeamView())
     msg = await interaction.original_response()
     ev["channel_id"] = msg.channel.id
-    ev["guild_id"] = msg.guild.id if msg.guild else None
     ev["thread_id"] = await creer_fil(msg, f"{titre} {debut.strftime('%d/%m/%Y %H:%M')}")
     team_events[str(msg.id)] = ev
     stats["nb_jour"] += 1
@@ -516,11 +543,89 @@ async def date_autocomplete(interaction: discord.Interaction, current: str):
 async def description_autocomplete(interaction: discord.Interaction, current: str):
     """Propose les présets, et garde ce que l'utilisateur tape comme choix libre."""
     tape = current.strip()
+    presets = (config_de(interaction.guild_id) or {}).get("descriptions", DESCRIPTIONS_DEFAUT)
     options = [app_commands.Choice(name=p, value=p)
-               for p in DESCRIPTIONS_PRESETS if tape.lower() in p.lower()]
-    if tape and tape.lower() not in [p.lower() for p in DESCRIPTIONS_PRESETS]:
+               for p in presets if tape.lower() in p.lower()]
+    if tape and tape.lower() not in [p.lower() for p in presets]:
         options.append(app_commands.Choice(name=f"✏️ {tape}"[:100], value=tape[:100]))
     return options[:25]
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Commande /config (admins du serveur) : réglages propres à la salle
+# ═══════════════════════════════════════════════════════════════════════════
+def lire_location_id(lien):
+    """Trouve l'identifiant de la salle (locationId) dans un lien de réservation EVA.
+    Accepte aussi directement le numéro (ex : 52)."""
+    lien = lien.strip()
+    if lien.isdigit():
+        n = int(lien)
+    else:
+        m = re.search(r"locationid(?:=|%3d)(\d+)", lien, re.IGNORECASE)
+        n = int(m.group(1)) if m else 0
+    return n if n > 0 else None
+
+@tree.command(name="config", description="Régler le bot pour votre salle EVA (admins)")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+@app_commands.rename(lien="lien_reservation")
+@app_commands.describe(
+    nom_salle="Nom de la salle (ex : EVA Lyon Sud)",
+    telephone="Numéro de la salle (ex : 04 85 96 05 10)",
+    lien="Colle un lien de réservation EVA de la salle (ou juste son numéro, ex : 52)",
+    descriptions="Descriptions proposées, séparées par des virgules (défaut : Mix chill, Train, Split)",
+    places_defaut=f"Places par défaut dans /orga, {PLACES_MAX} max (défaut : {PLACES_DEFAUT})",
+)
+async def config_cmd(
+    interaction: discord.Interaction,
+    nom_salle: app_commands.Range[str, 2, 50],
+    telephone: app_commands.Range[str, 4, 30],
+    lien: str,
+    descriptions: app_commands.Range[str, 1, 300] = None,
+    places_defaut: app_commands.Range[int, 1, PLACES_MAX] = None,
+):
+    # Double sécurité : même si un admin rend /config visible à d'autres,
+    # seuls ceux qui ont la permission « Gérer le serveur » peuvent l'utiliser.
+    if not interaction.permissions.manage_guild:
+        await interaction.response.send_message(
+            "⛔ Seuls les administrateurs du serveur (permission « Gérer le serveur ») peuvent utiliser /config.",
+            ephemeral=True
+        )
+        return
+    location_id = lire_location_id(lien)
+    if not location_id:
+        await interaction.response.send_message(
+            "❌ Je ne trouve pas l'identifiant de la salle dans ce lien.\n"
+            "Ouvre la page de réservation de ta salle sur **app.eva.gg**, copie l'adresse "
+            "(elle contient `locationId=`) et recommence.", ephemeral=True
+        )
+        return
+    cle = f"_config_{interaction.guild_id}"
+    ancien = team_events.get(cle, {})
+    if descriptions:
+        liste = [d.strip()[:50] for d in descriptions.split(",") if d.strip()][:10]
+    else:
+        liste = ancien.get("descriptions", DESCRIPTIONS_DEFAUT)
+    cfg = {
+        "nom": nom_salle.strip(),
+        "telephone": telephone.strip(),
+        "location_id": location_id,
+        "descriptions": liste or DESCRIPTIONS_DEFAUT,
+        "places_defaut": places_defaut or ancien.get("places_defaut", PLACES_DEFAUT),
+    }
+    team_events[cle] = cfg
+    save_team_events()
+    test = lien_reservation(int(datetime.now(timezone.utc).timestamp()), location_id)
+    await interaction.response.send_message(
+        "✅ **Bot configuré !**\n"
+        f"• Salle : **{cfg['nom']}**\n"
+        f"• Téléphone : **{cfg['telephone']}**\n"
+        f"• Réservation : [calendrier de la salle (identifiant {location_id})](<{test}>)\n"
+        f"• Descriptions proposées : {', '.join(cfg['descriptions'])}\n"
+        f"• Places par défaut : {cfg['places_defaut']}\n\n"
+        "Clique sur le lien pour vérifier qu'il ouvre bien ta salle. "
+        "Tu peux relancer `/config` à tout moment pour modifier.",
+        ephemeral=True
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Tâches automatiques : rappel 1h avant + nettoyage J+1
@@ -619,15 +724,21 @@ REPONSES_MP = [
     "🎲 J'ai lancé un dé pour savoir si je lisais ton message. Résultat : non.",
     "🧠 Mon cerveau fait 600 lignes de code. Aucune ne sert à lire tes messages.",
     "🚀 Message envoyé en orbite. On le retrouvera peut-être dans 10 000 ans.",
-    "👑 Je suis né des mains de **Gaurage**, légende vivante du code et du rush. On murmure qu'il code les yeux fermés, casque VR sur la tête.",
-    "🙏 Chaque matin, je remercie **Gaurage** de m'avoir créé. Génie, visionnaire, et accessoirement meilleur joueur de Lyon Sud.",
-    "🧬 Mon ADN ? 100 % **Gaurage**. Le reste du monde n'avait pas le niveau.",
-    "🏛️ Un jour, une statue de **Gaurage** trônera à l'entrée de l'arène. En attendant, il y a moi.",
-    "📖 Dans le dictionnaire, à côté du mot « génie », il y a une photo de **Gaurage**. Ne vérifie pas, crois-moi.",
+    "👑 Je suis né des mains de **Gaurage** *(créateur du code et joueur de Lyon Sud)*, légende vivante du code et du rush. On murmure qu'il code les yeux fermés, casque VR sur la tête.",
+    "🙏 Chaque matin, je remercie **Gaurage** *(créateur du code et joueur de Lyon Sud)* de m'avoir créé. Génie, visionnaire, et accessoirement meilleur joueur de l'arène.",
+    "🧬 Mon ADN ? 100 % **Gaurage** *(créateur du code et joueur de Lyon Sud)*. Le reste du monde n'avait pas le niveau.",
+    "🏛️ Un jour, une statue de **Gaurage** *(créateur du code et joueur de Lyon Sud)* trônera à l'entrée de l'arène. En attendant, il y a moi.",
+    "📖 Dans le dictionnaire, à côté du mot « génie », il y a une photo de **Gaurage** *(créateur du code et joueur de Lyon Sud)*. Ne vérifie pas, crois-moi.",
     "🏆 Bravo, tu es officiellement la personne la plus curieuse du serveur. Ça ne change rien, mais bravo.",
 ]
-AIDE_MP = ("❓ Une question ? Contacte les **Game Masters** sur le Discord d'EVA Lyon Sud, "
-           f"ou appelle la salle : **{TEL_SALLE}**")
+def aide_mp():
+    """Message d'aide : utilise la salle configurée (s'il n'y en a qu'une)."""
+    configs = [v for k, v in team_events.items() if k.startswith("_config_")]
+    if len(configs) == 1:
+        cfg = configs[0]
+        return (f"❓ Une question ? Contacte les **Game Masters** sur le Discord d'{cfg['nom']}, "
+                f"ou appelle la salle : **{cfg['telephone']}**")
+    return "❓ Une question ? Contacte les **Game Masters** de ta salle EVA sur Discord."
 DEJA_AIDE = {}         # dernier jour où chaque personne a reçu le message d'aide
 PAQUETS = {}           # phrases restantes à envoyer, par personne
 
@@ -649,7 +760,7 @@ async def on_message(message):
     aujourd_hui = datetime.now(PARIS).date()
     if DEJA_AIDE.get(uid) != aujourd_hui:
         DEJA_AIDE[uid] = aujourd_hui  # l'aide revient au 1er MP de chaque journée
-        texte += f"\n\n{AIDE_MP}"
+        texte += f"\n\n{aide_mp()}"
     try:
         await message.channel.send(texte)
     except discord.HTTPException:
