@@ -461,22 +461,58 @@ def liens_session(ev, lien_annonce):
                         f"**[💬 Voir l'organisation sur Discord]({lien_annonce})**" if lien_annonce else "") if l]
 
 # ── Modifier une session (organisateur ou admin) ────────────────────────────
-class ModifierModal(discord.ui.Modal, title="Modifier la session"):
-    def __init__(self, mid, ev):
-        super().__init__(timeout=600)
+def options_dates(jour_session=None):
+    """Les 25 prochains jours (+ le jour actuel de la session s'il est hors liste)."""
+    aujourd_hui = datetime.now(PARIS).date()
+    jours = [aujourd_hui + timedelta(days=i) for i in range(25)]
+    if jour_session and jour_session not in jours:
+        jours = [jour_session] + jours[:24]
+    options = []
+    for d in jours:
+        ecart = (d - aujourd_hui).days
+        prefixe = "Aujourd'hui" if ecart == 0 else "Demain" if ecart == 1 else JOURS_COURTS[d.weekday()]
+        options.append(discord.SelectOption(label=f"{prefixe} {d:%d/%m/%Y}", value=d.strftime("%d/%m/%Y"),
+                                            default=d == jour_session))
+    return options
+
+class SessionModal(discord.ui.Modal):
+    """Formulaire de /orga (création) et du bouton ⚙️ Gérer → Modifier (pré-rempli)."""
+    def __init__(self, guild_id, mid=None, ev=None):
+        super().__init__(title="Modifier la session" if ev else "Nouvelle session EVA", timeout=900)
         self.mid = mid
-        d = datetime.fromtimestamp(ev["start_ts"], PARIS)
-        self.date = discord.ui.TextInput(label="Date (JJ/MM/AAAA)", default=d.strftime("%d/%m/%Y"), max_length=30)
-        self.heure = discord.ui.TextInput(label="Heure (ex : 22, 22h10, 22:10)", default=d.strftime("%H:%M"), max_length=10)
-        self.nb = discord.ui.TextInput(label="Nombre de sessions de 40 min (1 à 4)", default=str(ev.get("nb_sessions", 1)), max_length=1)
-        self.desc = discord.ui.TextInput(label="Description", default=ev.get("description", "")[:100], max_length=100)
-        self.places = discord.ui.TextInput(label=f"Places (1 à {PLACES_MAX})", default=str(ev.get("places", PLACES_DEFAUT)), max_length=2)
-        for champ in (self.date, self.heure, self.nb, self.desc, self.places):
-            self.add_item(champ)
+        debut = datetime.fromtimestamp(ev["start_ts"], PARIS) if ev else None
+        presets = (config_de(guild_id) or {}).get("descriptions") or DESCRIPTIONS_DEFAUT
+        nb = ev.get("nb_sessions", 1) if ev else None
+        places = ev.get("places", PLACES_DEFAUT) if ev else PLACES_DEFAUT
+
+        self.date = discord.ui.Select(placeholder="Choisis le jour", options=options_dates(debut.date() if debut else None))
+        self.heure = discord.ui.TextInput(placeholder="ex : 22, 22h10, 22:10", max_length=10,
+                                          default=debut.strftime("%H:%M") if debut else None)
+        self.nb = discord.ui.Select(placeholder="Combien de sessions de 40 min ?", options=[
+            discord.SelectOption(label=f"{n} session{'s' if n > 1 else ''} ({n * DUREE_SESSION} min)", value=str(n), default=n == nb)
+            for n in range(1, 5)])
+        self.desc = discord.ui.TextInput(max_length=100, placeholder=", ".join(presets)[:100],
+                                         default=(ev.get("description") if ev else presets[0])[:100])
+        self.places = discord.ui.Select(options=[
+            discord.SelectOption(label=f"{n} place{'s' if n > 1 else ''}", value=str(n), default=n == places)
+            for n in range(1, PLACES_MAX + 1)])
+        for texte, aide, champ in (
+            ("📅 Date", None, self.date),
+            ("🕙 Heure de début", None, self.heure),
+            ("🎮 Sessions", None, self.nb),
+            ("📝 Description", ", ".join(presets)[:84] + "… ou ton texte", self.desc),
+            ("👥 Places", f"{PLACES_MAX} max", self.places),
+        ):
+            self.add_item(discord.ui.Label(text=texte, description=aide, component=champ))
 
     async def on_submit(self, interaction: discord.Interaction):
-        await appliquer_modif(interaction, self.mid, self.date.value, self.heure.value,
-                              self.nb.value, self.desc.value, self.places.value)
+        valeurs = (self.date.values[0] if self.date.values else "", self.heure.value,
+                   self.nb.values[0] if self.nb.values else "", self.desc.value,
+                   self.places.values[0] if self.places.values else "")
+        if self.mid:
+            await appliquer_modif(interaction, self.mid, *valeurs)
+        else:
+            await creer_session(interaction, *valeurs)
 
 def lien_annonce(ev, mid, interaction):
     salon = ev.get("channel_id") or getattr(interaction.channel, "id", 0)
@@ -603,7 +639,7 @@ class GererView(discord.ui.View):
     async def modifier(self, interaction: discord.Interaction, button: discord.ui.Button):
         ev = await self._session(interaction)
         if ev:
-            await interaction.response.send_modal(ModifierModal(self.mid, ev))
+            await interaction.response.send_modal(SessionModal(ev.get("guild_id"), self.mid, ev))
 
     @discord.ui.button(label="🗑️ Annuler la session", style=discord.ButtonStyle.danger)
     async def annuler(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -719,61 +755,50 @@ class TeamView(discord.ui.View):
 # ═══════════════════════════════════════════════════════════════════════════
 #  Commande /orga
 # ═══════════════════════════════════════════════════════════════════════════
-@tree.command(name="orga", description="Créer une session EVA")
-@app_commands.describe(
-    date="Choisis dans la liste ou tape JJ/MM (année en cours ajoutée)",
-    heure="Heure de début (ex : 22, 22h, 22h10, 22:10, 22.10)",
-    sessions="Combien de sessions de 40 min à la suite ?",
-    description="Mix chill, Train, Split… ou tape ton propre texte",
-    places=f"Nombre de places, {PLACES_MAX} max (défaut : {PLACES_DEFAUT})",
-)
-@app_commands.choices(sessions=[
-    app_commands.Choice(name="1 session", value=1),
-    app_commands.Choice(name="2 sessions", value=2),
-    app_commands.Choice(name="3 sessions", value=3),
-    app_commands.Choice(name="4 sessions", value=4),
-])
-async def session_cmd(
-    interaction: discord.Interaction,
-    date: str,
-    heure: str,
-    sessions: app_commands.Choice[int],
-    description: str,
-    places: app_commands.Range[int, 1, PLACES_MAX] = PLACES_DEFAUT,
-):
+async def verifier_orga(interaction):
+    """Config faite et limites anti-abus respectées ? Sinon répond et renvoie None."""
     cfg = config_de(interaction.guild_id)
     if not cfg:
         await interaction.response.send_message(
-            "⚙️ Le bot n'est pas encore configuré sur ce serveur : un admin doit lancer `/config`.",
-            ephemeral=True
-        )
-        return
-    try:
-        debut = parse_date_heure(date, heure)
-    except ValueError:
-        await interaction.response.send_message(
-            f"Je n'ai pas compris la date `{date}` ou l'heure `{heure}`.\n"
-            f"Exemples : date `14/10/2026` ou `14/10`, heure `22`, `22h10` ou `22:10`",
-            ephemeral=True
-        )
-        return
-    if debut < datetime.now(PARIS) - timedelta(hours=1):
-        await interaction.response.send_message(
-            f"La date `{date}` à `{heure}` est déjà passée.", ephemeral=True
-        )
-        return
+            "⚙️ Le bot n'est pas encore configuré sur ce serveur : un admin doit lancer `/config`.", ephemeral=True)
+        return None
     stats = compteurs()
     if stats["nb_jour"] >= MAX_PAR_JOUR:
         await interaction.response.send_message(
-            f"🚫 Limite atteinte : {MAX_PAR_JOUR} sessions ont déjà été créées aujourd'hui. "
-            f"Réessaie demain !", ephemeral=True
-        )
-        return
+            f"🚫 Limite atteinte : {MAX_PAR_JOUR} sessions ont déjà été créées aujourd'hui. Réessaie demain !", ephemeral=True)
+        return None
     if stats["nb_mois"] >= MAX_PAR_MOIS:
         await interaction.response.send_message(
             f"🚫 Limite atteinte : {MAX_PAR_MOIS} sessions ont déjà été créées ce mois-ci. "
-            f"Réessaie le mois prochain !", ephemeral=True
-        )
+            f"Réessaie le mois prochain !", ephemeral=True)
+        return None
+    return stats
+
+@tree.command(name="orga", description="Créer une session EVA")
+async def session_cmd(interaction: discord.Interaction):
+    if await verifier_orga(interaction) is not None:
+        await interaction.response.send_modal(SessionModal(interaction.guild_id))
+
+async def creer_session(interaction, date, heure, nb, description, places):
+    stats = await verifier_orga(interaction)
+    if stats is None:
+        return
+    erreurs = []
+    debut = None
+    try:
+        debut = parse_date_heure(date, heure)
+        if debut < datetime.now(PARIS) - timedelta(hours=1):
+            erreurs.append(f"la date `{date}` à `{heure}` est déjà passée")
+    except ValueError:
+        erreurs.append(f"heure `{heure}` incomprise (ex : `22`, `22h10` ou `22:10`)")
+    n = int(nb) if str(nb).strip().isdecimal() else 0
+    if not 1 <= n <= 4:
+        erreurs.append("le nombre de sessions doit être entre 1 et 4")
+    pl = int(places) if str(places).strip().isdecimal() else 0
+    if not 1 <= pl <= PLACES_MAX:
+        erreurs.append(f"le nombre de places doit être entre 1 et {PLACES_MAX}")
+    if erreurs:
+        await interaction.response.send_message("❌ Session non créée : " + " ; ".join(erreurs) + ".", ephemeral=True)
         return
 
     desc = description.strip()[:100] or "Mix chill"
@@ -782,64 +807,28 @@ async def session_cmd(
         "organisateur_id": str(interaction.user.id),
         "description": desc,
         "start_ts": int(debut.timestamp()),
-        "nb_sessions": sessions.value,
+        "nb_sessions": n,
         "duree": DUREE_SESSION,
-        "places": places,
+        "places": pl,
         "cree_ts": int(datetime.now(timezone.utc).timestamp()),
         "presents": [],
         "attente": [],
         "guild_id": interaction.guild_id,
     }
-    await interaction.response.send_message(embed=build_team_embed(ev), view=TeamView())
-    msg = await interaction.original_response()
+    # Compté AVANT le premier « await » : 2 /orga envoyés en même temps ne peuvent pas dépasser la limite
+    stats["nb_jour"] += 1
+    stats["nb_mois"] += 1
+    try:
+        await interaction.response.send_message(embed=build_team_embed(ev), view=TeamView())
+        msg = await interaction.original_response()
+    except Exception:
+        stats["nb_jour"] -= 1
+        stats["nb_mois"] -= 1
+        raise
     ev["channel_id"] = msg.channel.id
     ev["thread_id"] = await creer_fil(msg, f"{desc[:80]} {debut.strftime('%d/%m/%Y %H:%M')}")
     team_events[str(msg.id)] = ev
-    stats["nb_jour"] += 1
-    stats["nb_mois"] += 1
     save_team_events()
-
-@session_cmd.autocomplete("date")
-async def date_autocomplete(interaction: discord.Interaction, current: str):
-    """Propose les 14 prochains jours, ou la date tapée complétée avec l'année."""
-    tape = current.strip()
-    options = []
-    if tape:
-        try:
-            jour, mois, annee = parse_date(tape)
-            if annee is None:
-                annee = parse_date_heure(tape, "0").year
-            d = datetime(annee, mois, jour)
-            valeur = d.strftime("%d/%m/%Y")
-            options.append(app_commands.Choice(name=f"{JOURS_COURTS[d.weekday()]} {valeur}", value=valeur))
-        except (ValueError, TypeError):
-            pass
-
-    aujourd_hui = datetime.now(PARIS).date()
-    for i in range(14):
-        d = aujourd_hui + timedelta(days=i)
-        valeur = d.strftime("%d/%m/%Y")
-        if tape and not valeur.startswith(tape) and tape not in valeur:
-            continue
-        if any(o.value == valeur for o in options):
-            continue
-        prefixe = "Aujourd'hui" if i == 0 else "Demain" if i == 1 else JOURS_COURTS[d.weekday()]
-        options.append(app_commands.Choice(name=f"{prefixe} {valeur}", value=valeur))
-
-    if tape and not options:
-        options.append(app_commands.Choice(name=f"✏️ {tape}"[:100], value=tape[:100]))
-    return options[:25]
-
-@session_cmd.autocomplete("description")
-async def description_autocomplete(interaction: discord.Interaction, current: str):
-    """Propose les présets, et garde ce que l'utilisateur tape comme choix libre."""
-    tape = current.strip()
-    presets = (config_de(interaction.guild_id) or {}).get("descriptions", DESCRIPTIONS_DEFAUT)
-    options = [app_commands.Choice(name=p, value=p)
-               for p in presets if tape.lower() in p.lower()]
-    if tape and tape.lower() not in [p.lower() for p in presets]:
-        options.append(app_commands.Choice(name=f"✏️ {tape}"[:100], value=tape[:100]))
-    return options[:25]
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Commande /config (admins du serveur) : réglages propres à la salle
