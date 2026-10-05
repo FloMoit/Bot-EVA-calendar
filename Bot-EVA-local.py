@@ -25,8 +25,7 @@ MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
 MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
 PLACES_DEFAUT = 8                       # places par défaut dans /orga (modifiable à chaque fois)
 DESCRIPTIONS_DEFAUT = ["Mix Chill", "Train", "Split"]
-CREDIT_COURT = "🤖 Bot développé par Gaurage, joueur de Lyon"
-CREDIT = "-# 🤖 Bot développé par **Gaurage**, joueur de Lyon"
+CREDIT = "-# *🤖 Bot développé par **Gaurage**, joueur de Lyon*"
 # Le nom de la salle, son téléphone et son identifiant EVA se règlent
 # directement sur Discord avec /config (réservé aux admins du serveur).
 
@@ -503,7 +502,7 @@ class SessionModal(discord.ui.Modal):
             ("🕙 Heure de début", None, self.heure),
             ("🎮 Sessions", None, self.nb),
             ("📝 Description", "ex : " + ", ".join(presets)[:80] + "… ou ton texte", self.desc),
-            ("👥 Places", f"{PLACES_MAX} max · {CREDIT_COURT}", self.places),
+            ("👥 Places", f"{PLACES_MAX} max", self.places),
         ):
             self.add_item(discord.ui.Label(text=texte, description=aide, component=champ))
 
@@ -587,7 +586,7 @@ async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
     if ids_retro:
         ev["dm_envoyes"] = [u for u in ev.get("dm_envoyes", []) if u not in ids_retro]
 
-    await interaction.response.edit_message(content="✅ Session modifiée : les joueurs sont prévenus en MP.", view=None)
+    await interaction.response.edit_message(view=vue_texte("✅ Session modifiée : les joueurs sont prévenus en MP."))
     save_team_events()
     await maj_annonce(ev, mid, interaction.channel)
     lien = lien_annonce(ev, mid, interaction)
@@ -625,44 +624,62 @@ async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
     await prevenir_complet(ev, lien)
 
 # ── Menu ⚙️ Gérer (visible seulement par l'organisateur / un admin) ─────────
-class GererView(discord.ui.View):
+# Le menu ⚙️ utilise la mise en page « Components V2 » de Discord : elle permet du texte SOUS
+# les boutons (la signature). Un message en V2 ne peut plus afficher de « content » classique :
+# toutes ses mises à jour passent donc par vue_texte().
+def vue_texte(texte):
+    vue = discord.ui.LayoutView(timeout=None)
+    vue.add_item(discord.ui.TextDisplay(texte))
+    return vue
+
+def bouton(label, style, callback):
+    b = discord.ui.Button(label=label, style=style)
+    b.callback = callback
+    return b
+
+class GererView(discord.ui.LayoutView):
     def __init__(self, mid):
         super().__init__(timeout=600)
         self.mid = mid
+        self.add_item(discord.ui.TextDisplay("⚙️ Que veux-tu faire ?"))
+        self.add_item(discord.ui.ActionRow(
+            bouton("✏️ Modifier", discord.ButtonStyle.primary, self.modifier),
+            bouton("🗑️ Annuler la session", discord.ButtonStyle.danger, self.annuler)))
+        self.add_item(discord.ui.TextDisplay(CREDIT))
 
     async def _session(self, interaction):
         ev = team_events.get(self.mid)
         if not ev:
-            await interaction.response.edit_message(content="Cette session n'existe plus.", view=None)
+            await interaction.response.edit_message(view=vue_texte("Cette session n'existe plus."))
             return None
         return ev
 
-    @discord.ui.button(label="✏️ Modifier", style=discord.ButtonStyle.primary)
-    async def modifier(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def modifier(self, interaction: discord.Interaction):
         ev = await self._session(interaction)
         if ev:
             await interaction.response.send_modal(SessionModal(ev.get("guild_id"), self.mid, ev))
 
-    @discord.ui.button(label="🗑️ Annuler la session", style=discord.ButtonStyle.danger)
-    async def annuler(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def annuler(self, interaction: discord.Interaction):
         if await self._session(interaction):
-            await interaction.response.edit_message(
-                content="Annuler cette session ? L'annonce et le fil seront supprimés et les joueurs prévenus en MP.",
-                view=ConfirmerAnnulation(self.mid))
+            await interaction.response.edit_message(view=ConfirmerAnnulation(self.mid))
 
 # ── Annuler une session (organisateur ou admin) ─────────────────────────────
-class ConfirmerAnnulation(discord.ui.View):
+class ConfirmerAnnulation(discord.ui.LayoutView):
     def __init__(self, mid):
         super().__init__(timeout=60)
         self.mid = mid
+        self.add_item(discord.ui.TextDisplay(
+            "Annuler cette session ? L'annonce et le fil seront supprimés et les joueurs prévenus en MP."))
+        self.add_item(discord.ui.ActionRow(
+            bouton("Oui, annuler la session", discord.ButtonStyle.danger, self.confirmer),
+            bouton("Non, garder la session", discord.ButtonStyle.secondary, self.garder)))
 
-    @discord.ui.button(label="Oui, annuler la session", style=discord.ButtonStyle.danger)
-    async def confirmer(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def confirmer(self, interaction: discord.Interaction):
         ev = team_events.pop(self.mid, None)
         if not ev:
-            await interaction.response.edit_message(content="Cette session n'existe plus.", view=None)
+            await interaction.response.edit_message(view=vue_texte("Cette session n'existe plus."))
             return
-        await interaction.response.edit_message(content="🗑️ Session annulée : les joueurs sont prévenus en MP.", view=None)
+        await interaction.response.edit_message(view=vue_texte("🗑️ Session annulée : les joueurs sont prévenus en MP."))
         nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
         embed = discord.Embed(
             title=f"❌ {interaction.user.display_name} a annulé {nom} · {ev.get('description', ev['titre'])}"[:256],
@@ -682,9 +699,8 @@ class ConfirmerAnnulation(discord.ui.View):
             await supprimer_salon_ou_message(ev["channel_id"], int(self.mid))
         save_team_events()
 
-    @discord.ui.button(label="Non, garder la session", style=discord.ButtonStyle.secondary)
-    async def garder(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="👍 La session est conservée.", view=None)
+    async def garder(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=vue_texte("👍 La session est conservée."))
 
 class TeamView(discord.ui.View):
     def __init__(self):
@@ -752,7 +768,7 @@ class TeamView(discord.ui.View):
         elif not peut_gerer(interaction, ev):
             await interaction.response.send_message("⛔ Seul l'organisateur (ou un admin) peut gérer cette session.", ephemeral=True)
         else:
-            await interaction.response.send_message("⚙️ Que veux-tu faire ?", view=GererView(mid), ephemeral=True)
+            await interaction.response.send_message(view=GererView(mid), ephemeral=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Commande /orga
