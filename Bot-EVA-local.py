@@ -5,6 +5,7 @@ import json
 import os
 import random
 import re
+import signal
 import sys
 import queue
 import base64
@@ -21,6 +22,7 @@ from zoneinfo import ZoneInfo
 PARIS = ZoneInfo("Europe/Paris")
 DUREE_SESSION = 40                      # une session EVA dure toujours 40 min
 PLACES_MAX = 10                         # capacité max de l'arène
+NB_SESSIONS_MAX = 4                     # sessions enchaînées au maximum dans une annonce
 MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
 MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
 PLACES_DEFAUT = 8                       # places par défaut dans /orga (modifiable à chaque fois)
@@ -45,6 +47,12 @@ def lien_reservation(ts, location_id):
 #    DISCORD_TOKEN  : token du bot (obligatoire)
 #    GITHUB_TOKEN + GITHUB_REPO : stockage sur GitHub (sinon fichier local)
 # ═══════════════════════════════════════════════════════════════════════════
+try:   # charge le fichier .env placé à côté du script (sans écraser les variables déjà définies)
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
     print("ERREUR : DISCORD_TOKEN manquant dans le fichier .env")
@@ -79,6 +87,10 @@ def github_load():
                              params={"ref": GITHUB_BRANCH}, timeout=15)
             if r.status_code == 200:
                 data = r.json()
+                if data.get("size") and not (data.get("content") or "").strip():
+                    # Au-delà de 1 Mo, GitHub ne renvoie plus le contenu : ne surtout pas démarrer à vide
+                    print("❌ Fichier de données trop gros pour être lu sur GitHub : arrêt pour le protéger")
+                    sys.exit(1)
                 _sha = data["sha"]
                 decoded = base64.b64decode(data["content"]).decode("utf-8")
                 return json.loads(decoded) if decoded.strip() else {}
@@ -97,7 +109,8 @@ def _lire_sha():
     return r.json()["sha"] if r.status_code == 200 else None
 
 def github_write(json_str):
-    """Une seule requête par sauvegarde ; relit la version seulement en cas de conflit."""
+    """Une seule requête par sauvegarde ; relit la version seulement en cas de conflit.
+    Renvoie True si la sauvegarde est faite."""
     global _sha
     contenu = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
     for _ in range(2):
@@ -108,32 +121,62 @@ def github_write(json_str):
             r = requests.put(_gh_url(), headers=_gh_headers(), json=payload, timeout=15)
             if r.status_code in (200, 201):
                 _sha = r.json()["content"]["sha"]
-                return
+                return True
             if r.status_code in (409, 422):   # version périmée : on la relit et on réessaie
                 _sha = _lire_sha()
                 continue
             print(f"⚠️ GitHub save : {r.status_code} {r.text}")
-            return
+            return False
         except Exception as e:
             print(f"⚠️ Erreur GitHub save : {e}")
-            return
+            return False
+    print("⚠️ GitHub save : conflit de version persistant")
+    return False
+
+def avertir_si_depot_public():
+    """Les données contiennent des identifiants Discord : le dépôt doit rester privé."""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}", headers=_gh_headers(), timeout=15)
+        if r.status_code == 200 and not r.json().get("private"):
+            print(f"⚠️ Le dépôt {GITHUB_REPO} est PUBLIC : passe-le en privé (il contient les identifiants des joueurs)")
+    except Exception:
+        pass
 
 # Sauvegarde en arrière-plan : si plusieurs sauvegardes arrivent d'un coup
 # (plusieurs clics), seule la plus récente est envoyée à GitHub.
+# Une sauvegarde ratée est retentée (5 s, 10 s… jusqu'à 5 min) tant qu'elle n'est pas passée.
 _save_queue = queue.Queue()
+_STOP = object()   # demande d'arrêt : dernière sauvegarde puis fin du thread
 
 def _save_worker():
+    en_attente, delai, arret = None, 5, False
     while True:
-        json_str = _save_queue.get()
-        while not _save_queue.empty():   # on saute les versions déjà dépassées
-            json_str = _save_queue.get_nowait()
-        github_write(json_str)
+        try:
+            # Rien à envoyer : on attend. Sauvegarde ratée : on patiente « delai » avant de réessayer.
+            item = _save_queue.get(timeout=None if en_attente is None else delai)
+            while True:   # on saute les versions déjà dépassées
+                if item is _STOP:
+                    arret = True
+                else:
+                    en_attente = item
+                item = _save_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if en_attente is not None:
+            if github_write(en_attente):
+                en_attente, delai = None, 5
+            else:
+                delai = min(delai * 2, 300)
+        if arret:
+            return
 
+_save_thread = threading.Thread(target=_save_worker, daemon=True)
 if USE_GITHUB:
-    threading.Thread(target=_save_worker, daemon=True).start()
+    _save_thread.start()
 
 def load_team_events():
     if USE_GITHUB:
+        avertir_si_depot_public()
         return github_load()
     if os.path.exists(FICHIER_LOCAL):
         with open(FICHIER_LOCAL, "r", encoding="utf-8") as f:
@@ -144,12 +187,16 @@ def save_team_events():
     if USE_GITHUB:
         _save_queue.put(json.dumps(team_events, ensure_ascii=False))
     else:
-        with open(FICHIER_LOCAL, "w", encoding="utf-8") as f:
+        # Fichier temporaire puis remplacement : jamais de fichier à moitié écrit
+        temp = FICHIER_LOCAL + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
             json.dump(team_events, f, ensure_ascii=False)
+        os.replace(temp, FICHIER_LOCAL)
 
 team_events = load_team_events()
+# Clés rangées avec les sessions, mais qui ne sont pas des sessions
 CLE_STATS = "_compteurs"
-CLE_BLAGUES = "_mp_blagues"   # réponses drôles envoyées en MP (effacées après 24h)   # rangé avec les sessions, mais ce n'est pas une session
+CLE_BLAGUES = "_mp_blagues"   # réponses drôles envoyées en MP (effacées après 24h)
 
 def sessions():
     """Toutes les sessions (sans les compteurs)."""
@@ -178,8 +225,15 @@ def compteurs():
 #  Bot
 # ═══════════════════════════════════════════════════════════════════════════
 # Jamais de @everyone / @here / rôle déclenché par un texte saisi par un joueur
-bot = discord.Client(intents=discord.Intents.default(),
-                     allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
+class BotEVA(discord.Client):
+    async def setup_hook(self):
+        # Avant la connexion : les boutons des anciennes annonces répondent dès le démarrage
+        self.add_view(TeamView())
+        self.add_view(VueMP())
+        await tree.sync()
+
+bot = BotEVA(intents=discord.Intents.default(),
+             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
 tree = app_commands.CommandTree(bot)
 
 def joueur_lien(p):
@@ -252,7 +306,7 @@ async def creer_fil(msg, nom):
     try:
         fil = await msg.create_thread(name=nom[:100], auto_archive_duration=1440)
         return fil.id
-    except discord.HTTPException as e:
+    except (discord.HTTPException, ValueError, TypeError) as e:
         print(f"⚠️ Fil impossible (permission 'Créer des fils publics' ?) : {e}")
         return None
 
@@ -340,19 +394,24 @@ def lien_google_agenda(ev):
     n = ev.get("nb_sessions", 1)
     heures = " · ".join(datetime.fromtimestamp(debut + i * ev.get("duree", DUREE_SESSION) * 60, PARIS).strftime("%H:%M")
                         for i in range(n))
-    joueurs = ", ".join(p["pseudo"] for p in ev.get("presents", []))
-    details = [f"{n} session{'s' if n > 1 else ''} de {ev.get('duree', DUREE_SESSION)} min : {heures}",
-               f"Joueurs ({len(ev.get('presents', []))}/{ev.get('places', 8)}) : {joueurs or '—'}"]
-    if cfg.get("telephone"):
-        details.append(f"Un retard ? {cfg['telephone']}")
+    presents = ev.get("presents", [])
     params = {
         "action": "TEMPLATE",
         "text": f"{nom} · {ev.get('description', ev['titre'])[:100]}",
         "dates": f"{fmt(debut)}/{fmt(fin)}",
-        "details": "\n".join(details),
         "location": nom,
     }
-    return "https://calendar.google.com/calendar/render?" + urlencode(params)
+    # Pseudos remplacés par un renvoi si le lien devient trop long pour tenir dans l'annonce
+    for joueurs in (", ".join(p["pseudo"] for p in presents) or "—", "voir l'annonce Discord"):
+        details = [f"{n} session{'s' if n > 1 else ''} de {ev.get('duree', DUREE_SESSION)} min : {heures}",
+                   f"Joueurs ({len(presents)}/{ev.get('places', PLACES_DEFAUT)}) : {joueurs}"]
+        if cfg.get("telephone"):
+            details.append(f"Un retard ? {cfg['telephone']}")
+        params["details"] = "\n".join(details)
+        url = "https://calendar.google.com/calendar/render?" + urlencode(params)
+        if len(url) <= 1500:
+            break
+    return url
 
 def ligne_agenda(ev):
     return f"**[📅 Ajouter à mon Google Agenda]({lien_google_agenda(ev)})**"
@@ -363,7 +422,8 @@ def build_team_embed(ev):
     d = ev.get("duree", DUREE_SESSION)
     orga = f"<@{ev['organisateur_id']}>" if ev.get("organisateur_id") else ev.get("organisateur", "?")
     # La description est déjà dans le titre ; on ne la répète que pour les anciennes annonces
-    bloc_desc = "" if ev["titre"].startswith(ev["description"]) else f"**Description**\n{ev['description'][:1000]}\n\n"
+    bloc_desc = ("" if ev["titre"].startswith(ev["description"])
+                 else f"**Description**\n{discord.utils.escape_markdown(ev['description'][:1000])}\n\n")
     embed = discord.Embed(
         title=f"🎮 {ev['titre']}"[:256],
         description=(
@@ -377,7 +437,7 @@ def build_team_embed(ev):
     )
     presents = ev["presents"]
     embed.add_field(
-        name=f"✅ Inscrits ({len(presents)}/{ev.get('places', 8)})",
+        name=f"✅ Inscrits ({len(presents)}/{ev.get('places', PLACES_DEFAUT)})",
         value=liste_champ([f"{i}. {joueur_lien(p)}" for i, p in enumerate(presents, 1)]),
         inline=False
     )
@@ -394,16 +454,17 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
     ts = ev["start_ts"]
     n = ev.get("nb_sessions", 1)
     nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
-    joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
+    # Texte saisi par les joueurs : neutralisé pour qu'il ne puisse pas créer de lien cliquable
+    joueurs = "\n".join(f"{i}. {discord.utils.escape_markdown(p['pseudo'])}" for i, p in enumerate(ev["presents"], 1))
     titre = "🎉 Une place s'est libérée, tu es inscrit !" if promu else "✅ Session complète !"
     liens = liens_session(ev, lien_annonce)
     embed = discord.Embed(
         title=titre,
         description=(
-            f"**{nom}** · {ev.get('description', ev['titre'])}\n\n"
+            f"**{nom}** · {discord.utils.escape_markdown(ev.get('description', ev['titre']))}\n\n"
             f"📅 **Quand**\n<t:{ts}:F>\n\n"
             f"🕙 **Sessions**\n{horaires_sessions(ev)} ({n} × {ev.get('duree', DUREE_SESSION)} min)\n\n"
-            f"👥 **Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
+            f"👥 **Joueurs ({len(ev['presents'])}/{ev.get('places', PLACES_DEFAUT)})**\n{joueurs}\n\n"
             + "\n\n".join(liens)
         )[:4096],
         color=0x2ECC71
@@ -448,7 +509,7 @@ def memoriser_temp(msg):
 async def prevenir_complet(ev, lien_annonce, promus=()):
     """MP « place libérée » aux promus, et « session complète » à ceux qui ne l'ont pas encore."""
     deja = set(ev.get("dm_envoyes", []))
-    cibles = [p["id"] for p in ev["presents"] if p["id"] not in deja] if len(ev["presents"]) >= ev.get("places", 8) else []
+    cibles = [p["id"] for p in ev["presents"] if p["id"] not in deja] if len(ev["presents"]) >= ev.get("places", PLACES_DEFAUT) else []
     for p in promus:
         if p["id"] not in cibles:
             cibles.append(p["id"])
@@ -493,7 +554,7 @@ class SessionModal(discord.ui.Modal):
                                           default=debut.strftime("%H:%M") if debut else None)
         self.nb = discord.ui.Select(placeholder="Combien de sessions de 40 min ?", options=[
             discord.SelectOption(label=f"{n} session{'s' if n > 1 else ''} ({n * DUREE_SESSION} min)", value=str(n), default=n == nb)
-            for n in range(1, 5)])
+            for n in range(1, NB_SESSIONS_MAX + 1)])
         self.desc = discord.ui.TextInput(max_length=100, placeholder=", ".join(presets)[:100],
                                          default=(ev.get("description") if ev else presets[0])[:100])
         self.places = discord.ui.Select(options=[
@@ -517,7 +578,7 @@ class SessionModal(discord.ui.Modal):
         else:
             await creer_session(interaction, *valeurs)
 
-def lien_annonce(ev, mid, interaction):
+def lien_vers_annonce(ev, mid, interaction):
     salon = ev.get("channel_id") or getattr(interaction.channel, "id", 0)
     return f"https://discord.com/channels/{ev.get('guild_id') or interaction.guild_id}/{salon}/{mid}"
 
@@ -532,25 +593,31 @@ async def maj_annonce(ev, mid, salon_menu=None):
 def quand(ts):
     return f"<t:{ts}:f>"
 
-async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
-    ev = team_events.get(mid)
-    if not ev:
-        await interaction.response.send_message("Cette session n'existe plus.", ephemeral=True)
-        return
+def lire_saisie(date, heure, nb, places):
+    """Vérifie les champs du formulaire de session -> (debut, nb_sessions, places, erreurs)."""
     erreurs = []
+    debut = None
     try:
         debut = parse_date_heure(date, heure)
         if debut < datetime.now(PARIS) - timedelta(hours=1):
             erreurs.append(f"la date `{date}` à `{heure}` est déjà passée")
     except ValueError:
         erreurs.append(f"date `{date}` ou heure `{heure}` incomprise (ex : `14/10/2026` et `22h10`)")
-    n = int(nb) if nb.strip().isdecimal() else 0
-    if not 1 <= n <= 4:
-        erreurs.append("le nombre de sessions doit être entre 1 et 4")
-    pl = int(places) if places.strip().isdecimal() else 0
+    n = int(nb) if str(nb).strip().isdecimal() else 0
+    if not 1 <= n <= NB_SESSIONS_MAX:
+        erreurs.append(f"le nombre de sessions doit être entre 1 et {NB_SESSIONS_MAX}")
+    pl = int(places) if str(places).strip().isdecimal() else 0
     if not 1 <= pl <= PLACES_MAX:
         erreurs.append(f"le nombre de places doit être entre 1 et {PLACES_MAX}")
-    desc = desc.strip()[:100] or ev.get("description", "Mix Chill")
+    return debut, n, pl, erreurs
+
+async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
+    ev = team_events.get(mid)
+    if not ev:
+        await interaction.response.send_message("Cette session n'existe plus.", ephemeral=True)
+        return
+    debut, n, pl, erreurs = lire_saisie(date, heure, nb, places)
+    desc = desc.strip()[:100] or ev.get("description", DESCRIPTIONS_DEFAUT[0])
     if erreurs:
         await interaction.response.send_message("❌ Rien n'a été modifié : " + " ; ".join(erreurs) + ".", ephemeral=True)
         return
@@ -564,8 +631,8 @@ async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
     if desc != ev.get("description"):
         changements.append(("📝 Description", discord.utils.escape_markdown(ev.get("description", "—")),
                             discord.utils.escape_markdown(desc)))
-    if pl != ev.get("places", 8):
-        changements.append(("👥 Places", str(ev.get("places", 8)), str(pl)))
+    if pl != ev.get("places", PLACES_DEFAUT):
+        changements.append(("👥 Places", str(ev.get("places", PLACES_DEFAUT)), str(pl)))
     if not changements:
         await interaction.response.send_message("Aucun changement : la session est identique.", ephemeral=True)
         return
@@ -592,10 +659,10 @@ async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
     # peuvent cliquer (Sortir, Présent…) et changer les listes.
     destinataires = list(ev["presents"] + ev["attente"])
     positions = {x["id"]: i for i, x in enumerate(ev["attente"], 1)}
+    save_team_events()   # avant de répondre : la modification est gardée même si Discord échoue
     await interaction.response.edit_message(view=vue_texte("✅ Session modifiée : les joueurs sont prévenus en MP."))
-    save_team_events()
     await maj_annonce(ev, mid, interaction.channel)
-    lien = lien_annonce(ev, mid, interaction)
+    lien = lien_vers_annonce(ev, mid, interaction)
     auteur = interaction.user.display_name
     nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
     resume = "\n\n".join(f"**{lab}**\n~~{av}~~ → **{ap}**" for lab, av, ap in changements)
@@ -684,6 +751,7 @@ class ConfirmerAnnulation(discord.ui.LayoutView):
         if not ev:
             await interaction.response.edit_message(view=vue_texte("Cette session n'existe plus."))
             return
+        save_team_events()   # tout de suite : un redémarrage ne ressuscite pas la session
         await interaction.response.edit_message(view=vue_texte("🗑️ Session annulée : les joueurs sont prévenus en MP."))
         nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
         embed = discord.Embed(
@@ -719,7 +787,7 @@ class TeamView(discord.ui.View):
         ev.setdefault("attente", [])
         user_id = str(interaction.user.id)
         joueur = {"id": user_id, "pseudo": interaction.user.display_name}
-        places = ev.get("places", 8)
+        places = ev.get("places", PLACES_DEFAUT)
         inscrit = any(p["id"] == user_id for p in ev["presents"])
         en_attente = any(p["id"] == user_id for p in ev["attente"])
         promu = None
@@ -744,8 +812,8 @@ class TeamView(discord.ui.View):
                 promu = ev["attente"].pop(0)
                 ev["presents"].append(promu)
 
+        save_team_events()   # avant de répondre : l'inscription est gardée même si Discord échoue
         await interaction.response.edit_message(embed=build_team_embed(ev), view=TeamView())
-        save_team_events()
         if info:
             await interaction.followup.send(info, ephemeral=True)
 
@@ -798,6 +866,7 @@ async def verifier_orga(interaction):
     return stats
 
 @tree.command(name="orga", description="Créer une session EVA")
+@app_commands.guild_only()   # pas en MP : une annonce a besoin d'un salon de serveur
 async def session_cmd(interaction: discord.Interaction):
     if await verifier_orga(interaction) is not None:
         await interaction.response.send_modal(SessionModal(interaction.guild_id))
@@ -806,25 +875,15 @@ async def creer_session(interaction, date, heure, nb, description, places):
     stats = await verifier_orga(interaction)
     if stats is None:
         return
-    erreurs = []
-    debut = None
-    try:
-        debut = parse_date_heure(date, heure)
-        if debut < datetime.now(PARIS) - timedelta(hours=1):
-            erreurs.append(f"la date `{date}` à `{heure}` est déjà passée")
-    except ValueError:
-        erreurs.append(f"heure `{heure}` incomprise (ex : `22`, `22h10` ou `22:10`)")
-    n = int(nb) if str(nb).strip().isdecimal() else 0
-    if not 1 <= n <= 4:
-        erreurs.append("le nombre de sessions doit être entre 1 et 4")
-    pl = int(places) if str(places).strip().isdecimal() else 0
-    if not 1 <= pl <= PLACES_MAX:
-        erreurs.append(f"le nombre de places doit être entre 1 et {PLACES_MAX}")
+    if interaction.guild_id is None:   # ancienne commande encore visible en MP avant la synchro
+        await interaction.response.send_message("❌ `/orga` s'utilise dans un salon du serveur.", ephemeral=True)
+        return
+    debut, n, pl, erreurs = lire_saisie(date, heure, nb, places)
     if erreurs:
         await interaction.response.send_message("❌ Session non créée : " + " ; ".join(erreurs) + ".", ephemeral=True)
         return
 
-    desc = description.strip()[:100] or "Mix Chill"
+    desc = description.strip()[:100] or DESCRIPTIONS_DEFAUT[0]
     ev = {
         "titre": f"{desc} · {debut.strftime('%H:%M')}",
         "organisateur_id": str(interaction.user.id),
@@ -849,10 +908,17 @@ async def creer_session(interaction, date, heure, nb, description, places):
         stats["nb_mois"] -= 1
         raise
     ev["channel_id"] = msg.channel.id
-    ev["thread_id"] = await creer_fil(msg, f"{desc[:80]} {debut.strftime('%d/%m/%Y %H:%M')}")
-    team_events[str(msg.id)] = ev
+    mid = str(msg.id)
+    # Enregistrée AVANT de créer le fil : les boutons de l'annonce répondent tout de suite
+    team_events[mid] = ev
     save_team_events()
-    await notifier_role(ev, interaction.user)
+    fil = await creer_fil(msg, f"{desc[:80]} {debut.strftime('%d/%m/%Y %H:%M')}")
+    if team_events.get(mid) is ev:
+        ev["thread_id"] = fil
+        save_team_events()
+        await notifier_role(ev, interaction.user)
+    elif fil:   # session annulée pendant la création du fil
+        await supprimer_salon_ou_message(fil)
 
 async def notifier_role(ev, auteur):
     """Ping du rôle choisi dans /config, dans le fil : ses membres sont notifiés et le fil
@@ -1037,9 +1103,9 @@ async def nettoyage_j1():
             a_supprimer.append(mid)
     for mid in a_supprimer:
         ev = team_events.pop(mid, {})
-        for canal, message in ev.get("mps", []):
-            await supprimer_mp(canal, message)
         try:
+            for canal, message in ev.get("mps", []):
+                await supprimer_mp(canal, message)
             if ev.get("thread_id"):
                 await supprimer_salon_ou_message(ev["thread_id"])
             if ev.get("channel_id"):
@@ -1047,12 +1113,16 @@ async def nettoyage_j1():
         except Exception as e:
             print(f"⚠️ Nettoyage session {mid} : {e}")
     # Réponses drôles en MP : effacées 24h après leur envoi
-    blagues = team_events.get(CLE_BLAGUES, [])
-    vieilles = [b for b in blagues if maintenant - b[2] > 24 * 3600]
-    for canal, message, _ in vieilles:
-        await supprimer_mp(canal, message)
-    if vieilles:
-        team_events[CLE_BLAGUES] = [b for b in blagues if maintenant - b[2] <= 24 * 3600]
+    vieilles = []
+    try:
+        blagues = team_events.get(CLE_BLAGUES, [])
+        vieilles = [b for b in blagues if maintenant - b[2] > 24 * 3600]
+        if vieilles:
+            team_events[CLE_BLAGUES] = [b for b in blagues if maintenant - b[2] <= 24 * 3600]
+        for canal, message, _ in vieilles:
+            await supprimer_mp(canal, message)
+    except Exception as e:
+        print(f"⚠️ Nettoyage des MP : {e}")
     if a_supprimer or vieilles:
         if a_supprimer:
             print(f"🧹 {len(a_supprimer)} session(s) supprimée(s) (J+1)")
@@ -1139,9 +1209,6 @@ async def on_ready():
         return
     _deja_pret = True
 
-    await tree.sync()
-    bot.add_view(TeamView())
-    bot.add_view(VueMP())
     if not nettoyage_j1.is_running():
         nettoyage_j1.start()
     if not rappels_1h.is_running():
@@ -1150,4 +1217,15 @@ async def on_ready():
     print(f"💾 Stockage : {'GitHub (' + GITHUB_REPO + ')' if USE_GITHUB else 'fichier local'}")
     print(f"🎮 Sessions actives : {len(sessions())}")
 
+def _arret_propre(*_):
+    """Arrêt demandé par le serveur (SIGTERM) : même fermeture propre qu'un Ctrl+C."""
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTERM, _arret_propre)
+
 bot.run(TOKEN)
+
+# Bot arrêté : on laisse partir la dernière sauvegarde avant de quitter
+if USE_GITHUB:
+    _save_queue.put(_STOP)
+    _save_thread.join(timeout=40)

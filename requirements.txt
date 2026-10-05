@@ -1,2 +1,4 @@
 discord.py>=2.6,<3
 requests>=2.31
+python-dotenv>=1.0
+tzdata
