@@ -25,6 +25,7 @@ MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
 MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
 PLACES_DEFAUT = 8                       # places par défaut dans /orga (modifiable à chaque fois)
 DESCRIPTIONS_DEFAUT = ["Mix Chill", "Train", "Split"]
+CREDIT = "-# 🤖 Bot développé par **Gaurage**, joueur de Lyon"
 # Le nom de la salle, son téléphone et son identifiant EVA se règlent
 # directement sur Discord avec /config (réservé aux admins du serveur).
 
@@ -750,7 +751,7 @@ class TeamView(discord.ui.View):
         elif not peut_gerer(interaction, ev):
             await interaction.response.send_message("⛔ Seul l'organisateur (ou un admin) peut gérer cette session.", ephemeral=True)
         else:
-            await interaction.response.send_message("⚙️ Que veux-tu faire ?", view=GererView(mid), ephemeral=True)
+            await interaction.response.send_message(f"⚙️ Que veux-tu faire ?\n{CREDIT}", view=GererView(mid), ephemeral=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Commande /orga
@@ -844,32 +845,52 @@ def lire_location_id(lien):
         n = int(m.group(1)) if m else 0
     return n if n > 0 else None
 
+REFUS_CONFIG = "⛔ Seuls les administrateurs du serveur (permission « Gérer le serveur ») peuvent utiliser /config."
+
+class ConfigModal(discord.ui.Modal, title="Réglages du bot"):
+    """Formulaire de /config, pré-rempli avec les réglages actuels du serveur."""
+    def __init__(self, guild_id):
+        super().__init__(timeout=900)
+        cfg = team_events.get(f"_config_{guild_id}", {})
+        self.nom = discord.ui.TextInput(min_length=2, max_length=50, placeholder="EVA Lyon Sud", default=cfg.get("nom"))
+        self.telephone = discord.ui.TextInput(min_length=4, max_length=30, placeholder="04 85 96 05 10", default=cfg.get("telephone"))
+        self.lien = discord.ui.TextInput(max_length=1000, placeholder="https://app.eva.gg/…locationId=52…",
+                                         default=str(cfg["location_id"]) if cfg.get("location_id") else None)
+        self.descriptions = discord.ui.TextInput(max_length=300, required=False, placeholder=", ".join(DESCRIPTIONS_DEFAUT),
+                                                 default=", ".join(cfg.get("descriptions") or DESCRIPTIONS_DEFAUT))
+        for texte, aide, champ in (
+            ("🏟️ Nom de la salle", None, self.nom),
+            ("📞 Téléphone de la salle", "Affiché dans le rappel 1h avant (en cas de retard)", self.telephone),
+            ("🎟️ Lien de réservation", "Colle l'adresse de la page de réservation de ta salle (ou juste son numéro, ex : 52)", self.lien),
+            ("📝 Descriptions proposées", "Séparées par des virgules (la 1re est pré-remplie dans /orga)", self.descriptions),
+        ):
+            self.add_item(discord.ui.Label(text=texte, description=aide, component=champ))
+        self.add_item(discord.ui.TextDisplay(CREDIT))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await enregistrer_config(interaction, self.nom.value, self.telephone.value,
+                                 self.lien.value, self.descriptions.value)
+
 @tree.command(name="config", description="Régler le bot pour votre salle EVA (admins)")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
-@app_commands.rename(lien="lien_reservation")
-@app_commands.describe(
-    nom_salle="Nom de la salle (ex : EVA Lyon Sud)",
-    telephone="Numéro de la salle (ex : 04 85 96 05 10)",
-    lien="Colle un lien de réservation EVA de la salle (ou juste son numéro, ex : 52)",
-    descriptions="Descriptions proposées, séparées par des virgules (défaut : Mix Chill, Train, Split)",
-)
-async def config_cmd(
-    interaction: discord.Interaction,
-    nom_salle: app_commands.Range[str, 2, 50],
-    telephone: app_commands.Range[str, 4, 30],
-    lien: str,
-    descriptions: app_commands.Range[str, 1, 300] = None,
-):
+async def config_cmd(interaction: discord.Interaction):
     # Double sécurité : même si un admin rend /config visible à d'autres,
     # seuls ceux qui ont la permission « Gérer le serveur » peuvent l'utiliser.
     if not interaction.permissions.manage_guild:
-        await interaction.response.send_message(
-            "⛔ Seuls les administrateurs du serveur (permission « Gérer le serveur ») peuvent utiliser /config.",
-            ephemeral=True
-        )
+        await interaction.response.send_message(REFUS_CONFIG, ephemeral=True)
         return
-    location_id = lire_location_id(lien)
+    await interaction.response.send_modal(ConfigModal(interaction.guild_id))
+
+async def enregistrer_config(interaction, nom_salle, telephone, lien, descriptions=None):
+    if not interaction.permissions.manage_guild:
+        await interaction.response.send_message(REFUS_CONFIG, ephemeral=True)
+        return
+    nom_salle, telephone = (nom_salle or "").strip()[:50], (telephone or "").strip()[:30]
+    if len(nom_salle) < 2 or len(telephone) < 4:
+        await interaction.response.send_message("❌ Le nom de la salle et le téléphone sont obligatoires.", ephemeral=True)
+        return
+    location_id = lire_location_id(lien or "")
     if not location_id:
         await interaction.response.send_message(
             "❌ Je ne trouve pas l'identifiant de la salle dans ce lien.\n"
@@ -884,8 +905,8 @@ async def config_cmd(
     else:
         liste = ancien.get("descriptions", DESCRIPTIONS_DEFAUT)
     cfg = {
-        "nom": nom_salle.strip(),
-        "telephone": telephone.strip(),
+        "nom": nom_salle,
+        "telephone": telephone,
         "location_id": location_id,
         "descriptions": liste or DESCRIPTIONS_DEFAUT,
     }
@@ -900,7 +921,7 @@ async def config_cmd(
         f"• Descriptions proposées : {', '.join(cfg['descriptions'])}\n"
         "\n"
         "Clique sur le lien pour vérifier qu'il ouvre bien ta salle. "
-        "Tu peux relancer `/config` à tout moment pour modifier.",
+        "Tu peux relancer `/config` à tout moment pour modifier (le formulaire est pré-rempli).",
         ephemeral=True
     )
 
