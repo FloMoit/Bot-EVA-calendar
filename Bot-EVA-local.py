@@ -25,6 +25,7 @@ MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
 MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
 PLACES_DEFAUT = 8                       # places par défaut dans /orga (modifiable à chaque fois)
 DESCRIPTIONS_DEFAUT = ["Mix Chill", "Train", "Split"]
+CREDIT_COURT = "🤖 Bot développé par Gaurage, joueur de Lyon"
 CREDIT = "-# 🤖 Bot développé par **Gaurage**, joueur de Lyon"
 # Le nom de la salle, son téléphone et son identifiant EVA se règlent
 # directement sur Discord avec /config (réservé aux admins du serveur).
@@ -502,7 +503,7 @@ class SessionModal(discord.ui.Modal):
             ("🕙 Heure de début", None, self.heure),
             ("🎮 Sessions", None, self.nb),
             ("📝 Description", "ex : " + ", ".join(presets)[:80] + "… ou ton texte", self.desc),
-            ("👥 Places", f"{PLACES_MAX} max", self.places),
+            ("👥 Places", f"{PLACES_MAX} max · {CREDIT_COURT}", self.places),
         ):
             self.add_item(discord.ui.Label(text=texte, description=aide, component=champ))
 
@@ -751,7 +752,7 @@ class TeamView(discord.ui.View):
         elif not peut_gerer(interaction, ev):
             await interaction.response.send_message("⛔ Seul l'organisateur (ou un admin) peut gérer cette session.", ephemeral=True)
         else:
-            await interaction.response.send_message(f"⚙️ Que veux-tu faire ?\n{CREDIT}", view=GererView(mid), ephemeral=True)
+            await interaction.response.send_message("⚙️ Que veux-tu faire ?", view=GererView(mid), ephemeral=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Commande /orga
