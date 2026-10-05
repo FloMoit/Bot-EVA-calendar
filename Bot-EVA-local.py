@@ -26,6 +26,8 @@ MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans
 PLACES_DEFAUT = 8                       # places par défaut dans /orga (modifiable à chaque fois)
 DESCRIPTIONS_DEFAUT = ["Mix Chill", "Train", "Split"]
 CREDIT = "-# *🤖 Bot développé par **Gaurage**, joueur de Lyon*"
+CREDIT_COURT = "🤖 Bot développé par Gaurage, joueur de Lyon"
+GARDER = object()  # « ne change pas ce réglage »
 # Le nom de la salle, son téléphone et son identifiant EVA se règlent
 # directement sur Discord avec /config (réservé aux admins du serveur).
 
@@ -586,6 +588,10 @@ async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
     if ids_retro:
         ev["dm_envoyes"] = [u for u in ev.get("dm_envoyes", []) if u not in ids_retro]
 
+    # Photo de la situation AVANT le premier « await » : pendant l'envoi des MP, d'autres joueurs
+    # peuvent cliquer (Sortir, Présent…) et changer les listes.
+    destinataires = list(ev["presents"] + ev["attente"])
+    positions = {x["id"]: i for i, x in enumerate(ev["attente"], 1)}
     await interaction.response.edit_message(view=vue_texte("✅ Session modifiée : les joueurs sont prévenus en MP."))
     save_team_events()
     await maj_annonce(ev, mid, interaction.channel)
@@ -604,14 +610,13 @@ async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
             print(f"⚠️ Fil non mis à jour : {e}")
 
     # MP aux inscrits et à la file d'attente (sauf l'auteur de la modif)
-    for p in ev["presents"] + ev["attente"]:
+    for p in destinataires:
         if p["id"] == str(interaction.user.id):
             continue
         if p["id"] in ids_promus:
             perso = "🎉 **Une place s'est libérée : tu es inscrit !**\n\n"
         elif p["id"] in ids_retro:
-            pos = next(i for i, x in enumerate(ev["attente"], 1) if x["id"] == p["id"])
-            perso = f"⏳ **Moins de places : tu passes en file d'attente (position {pos}).**\n\n"
+            perso = f"⏳ **Moins de places : tu passes en file d'attente (position {positions.get(p['id'], '?')}).**\n\n"
         else:
             perso = ""
         embed = discord.Embed(
@@ -847,6 +852,21 @@ async def creer_session(interaction, date, heure, nb, description, places):
     ev["thread_id"] = await creer_fil(msg, f"{desc[:80]} {debut.strftime('%d/%m/%Y %H:%M')}")
     team_events[str(msg.id)] = ev
     save_team_events()
+    await notifier_role(ev, interaction.user)
+
+async def notifier_role(ev, auteur):
+    """Ping du rôle choisi dans /config, dans le fil : ses membres sont notifiés et le fil
+    apparaît sous le salon dans leur liste. Sans rôle configuré : rien."""
+    role_id = (config_de(ev.get("guild_id")) or {}).get("role_id")
+    if not role_id or not ev.get("thread_id"):
+        return
+    try:
+        fil = bot.get_channel(ev["thread_id"]) or await bot.fetch_channel(ev["thread_id"])
+        await fil.send(f"📣 <@&{role_id}> nouvelle session organisée par {auteur.mention} : "
+                       f"**{ev['description']}**, <t:{ev['start_ts']}:F>",
+                       allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[discord.Object(role_id)]))
+    except Exception as e:
+        print(f"⚠️ Notification du rôle impossible : {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Commande /config (admins du serveur) : réglages propres à la salle
@@ -875,18 +895,21 @@ class ConfigModal(discord.ui.Modal, title="Réglages du bot"):
                                          default=str(cfg["location_id"]) if cfg.get("location_id") else None)
         self.descriptions = discord.ui.TextInput(max_length=300, required=False, placeholder=", ".join(DESCRIPTIONS_DEFAUT),
                                                  default=", ".join(cfg.get("descriptions") or DESCRIPTIONS_DEFAUT))
+        self.role = discord.ui.RoleSelect(required=False, min_values=0, max_values=1, placeholder="Aucun rôle (pas de notification)",
+                                          default_values=[discord.Object(cfg["role_id"])] if cfg.get("role_id") else [])
         for texte, aide, champ in (
-            ("🏟️ Nom de la salle", None, self.nom),
+            ("🏟️ Nom de la salle", CREDIT_COURT, self.nom),
             ("📞 Téléphone de la salle", "Affiché dans le rappel 1h avant (en cas de retard)", self.telephone),
             ("🎟️ Lien de réservation", "Colle l'adresse de la page de réservation de ta salle (ou juste son numéro, ex : 52)", self.lien),
             ("📝 Descriptions proposées", "Séparées par des virgules (la 1re est pré-remplie dans /orga)", self.descriptions),
+            ("📣 Rôle à notifier (facultatif)", "Ex : @Abonnés. Ce rôle est notifié dans le fil à chaque nouvelle session", self.role),
         ):
             self.add_item(discord.ui.Label(text=texte, description=aide, component=champ))
-        self.add_item(discord.ui.TextDisplay(CREDIT))
 
     async def on_submit(self, interaction: discord.Interaction):
+        role = self.role.values[0].id if self.role.values else None
         await enregistrer_config(interaction, self.nom.value, self.telephone.value,
-                                 self.lien.value, self.descriptions.value)
+                                 self.lien.value, self.descriptions.value, role)
 
 @tree.command(name="config", description="Régler le bot pour votre salle EVA (admins)")
 @app_commands.default_permissions(manage_guild=True)
@@ -899,13 +922,19 @@ async def config_cmd(interaction: discord.Interaction):
         return
     await interaction.response.send_modal(ConfigModal(interaction.guild_id))
 
-async def enregistrer_config(interaction, nom_salle, telephone, lien, descriptions=None):
+async def enregistrer_config(interaction, nom_salle, telephone, lien, descriptions=None, role_id=GARDER):
     if not interaction.permissions.manage_guild:
         await interaction.response.send_message(REFUS_CONFIG, ephemeral=True)
         return
     nom_salle, telephone = (nom_salle or "").strip()[:50], (telephone or "").strip()[:30]
     if len(nom_salle) < 2 or len(telephone) < 4:
         await interaction.response.send_message("❌ Le nom de la salle et le téléphone sont obligatoires.", ephemeral=True)
+        return
+    if role_id is not GARDER and role_id and role_id == interaction.guild_id:
+        # Sur Discord, le rôle @everyone a le même identifiant que le serveur
+        await interaction.response.send_message(
+            "❌ @everyone n'est pas accepté : il notifierait tout le serveur à chaque session. "
+            "Choisis un rôle dédié comme @Abonnés (ou laisse vide).", ephemeral=True)
         return
     location_id = lire_location_id(lien or "")
     if not location_id:
@@ -926,16 +955,19 @@ async def enregistrer_config(interaction, nom_salle, telephone, lien, descriptio
         "telephone": telephone,
         "location_id": location_id,
         "descriptions": liste or DESCRIPTIONS_DEFAUT,
+        "role_id": ancien.get("role_id") if role_id is GARDER else role_id,
     }
     team_events[cle] = cfg
     save_team_events()
     test = lien_reservation(int(datetime.now(timezone.utc).timestamp()), location_id)
+    role_txt = f"<@&{cfg['role_id']}>" if cfg["role_id"] else "aucun"
     await interaction.response.send_message(
         "✅ **Bot configuré !**\n"
         f"• Salle : **{cfg['nom']}**\n"
         f"• Téléphone : **{cfg['telephone']}**\n"
         f"• Réservation : [calendrier de la salle (identifiant {location_id})](<{test}>)\n"
         f"• Descriptions proposées : {', '.join(cfg['descriptions'])}\n"
+        f"• Rôle notifié à chaque nouvelle session : {role_txt}\n"
         "\n"
         "Clique sur le lien pour vérifier qu'il ouvre bien ta salle. "
         "Tu peux relancer `/config` à tout moment pour modifier (le formulaire est pré-rempli).",
