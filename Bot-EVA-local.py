@@ -174,7 +174,9 @@ def compteurs():
 # ═══════════════════════════════════════════════════════════════════════════
 #  Bot
 # ═══════════════════════════════════════════════════════════════════════════
-bot = discord.Client(intents=discord.Intents.default())
+# Jamais de @everyone / @here / rôle déclenché par un texte saisi par un joueur
+bot = discord.Client(intents=discord.Intents.default(),
+                     allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
 tree = app_commands.CommandTree(bot)
 
 def joueur_lien(p):
@@ -196,11 +198,35 @@ def horaires_sessions(ev):
     d = ev.get("duree", DUREE_SESSION)
     return " · ".join(f"<t:{ts + i * d * 60}:t>" for i in range(n))
 
+class VueMP(discord.ui.View):
+    """Bouton sous chaque MP du bot : efface tous les messages du bot dans la conversation."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🧹 Vider la conversation", style=discord.ButtonStyle.secondary, custom_id="mp_vider")
+    async def vider(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        n = 0
+        try:
+            async for m in interaction.channel.history(limit=500):
+                if m.author.id == bot.user.id:
+                    try:
+                        await m.delete()
+                        n += 1
+                    except discord.HTTPException:
+                        pass
+        except discord.HTTPException as e:
+            print(f"⚠️ Historique MP illisible ({interaction.user.id}) : {e}")
+        await interaction.followup.send(
+            f"🧹 C'est fait : {n} message{'s' if n > 1 else ''} du bot effacé{'s' if n > 1 else ''}.\n"
+            "ℹ️ Discord ne permet pas au bot d'effacer **tes** messages : survole-les → ⋯ → Supprimer.",
+            ephemeral=True)
+
 async def envoyer_mp(user_id, embed, ev=None):
     """Envoie un MP ; si une session est donnée, le retient pour l'effacer à J+1."""
     try:
         user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
-        msg = await user.send(embed=embed)
+        msg = await user.send(embed=embed, view=VueMP())
     except discord.HTTPException as e:
         print(f"⚠️ MP impossible à {user_id} (MP fermés ?) : {e}")
         return None
@@ -253,7 +279,7 @@ def parse_heure(heure_str):
     if s.endswith(":"):
         s = s[:-1]
     parts = s.split(":")
-    if not (1 <= len(parts) <= 2) or not all(p.isdigit() for p in parts):
+    if not (1 <= len(parts) <= 2) or not all(p.isdecimal() for p in parts):
         raise ValueError
     h = int(parts[0])
     m = int(parts[1]) if len(parts) == 2 else 0
@@ -271,7 +297,7 @@ def parse_date(date_str):
     if len(parts) not in (2, 3):
         raise ValueError
     jour = int(parts[0])
-    mois = int(parts[1]) if parts[1].isdigit() else MOIS_FR.get(parts[1])
+    mois = int(parts[1]) if parts[1].isdecimal() else MOIS_FR.get(parts[1])
     if mois is None:
         raise ValueError
     annee = None
@@ -314,8 +340,6 @@ def lien_google_agenda(ev):
     joueurs = ", ".join(p["pseudo"] for p in ev.get("presents", []))
     details = [f"{n} session{'s' if n > 1 else ''} de {ev.get('duree', DUREE_SESSION)} min : {heures}",
                f"Joueurs ({len(ev.get('presents', []))}/{ev.get('places', 8)}) : {joueurs or '—'}"]
-    if cfg.get("location_id"):
-        details.append(f"Réserver : {lien_reservation(debut, cfg['location_id'])}")
     if cfg.get("telephone"):
         details.append(f"Un retard ? {cfg['telephone']}")
     params = {
@@ -344,8 +368,8 @@ def build_team_embed(ev):
             f"{bloc_desc}"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires_sessions(ev)}\n\n"
-            f"{ligne_reservation(ev)}\n{ligne_agenda(ev)}"
-        ).strip(),
+            f"{ligne_reservation(ev)}\n\n{ligne_agenda(ev)}"
+        ).strip() + "\n\u200b",   # ligne invisible : espace avant « Inscrits »
         color=0x2ECC71
     )
     presents = ev["presents"]
@@ -369,8 +393,7 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
     nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
     joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
     titre = "🎉 Une place s'est libérée, tu es inscrit !" if promu else "✅ Session complète !"
-    liens = [l for l in (ligne_reservation(ev), ligne_agenda(ev),
-                         f"**[💬 Voir la partie sur Discord]({lien_annonce})**") if l]
+    liens = liens_session(ev, lien_annonce)
     embed = discord.Embed(
         title=titre,
         description=(
@@ -378,7 +401,7 @@ async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
             f"📅 **Quand**\n<t:{ts}:F>\n\n"
             f"🕙 **Sessions**\n{horaires_sessions(ev)} ({n} × {ev.get('duree', DUREE_SESSION)} min)\n\n"
             f"👥 **Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
-            + "\n".join(liens)
+            + "\n\n".join(liens)
         )[:4096],
         color=0x2ECC71
     )
@@ -392,7 +415,7 @@ async def envoyer_rappel(user_id, ev, lien_annonce):
     if cfg.get("telephone"):
         description += f"\n\n🚗 **Un retard ? Appelle la salle : {cfg['telephone']}**"
     if lien_annonce:
-        description += f"\n\n**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
+        description += f"\n\n**[💬 Voir l'organisation sur Discord]({lien_annonce})**"
     embed = discord.Embed(
         title=f"⏰ RAPPEL : Ta partie à {nom.upper()} c'est dans 1h : {ev.get('description', ev['titre'])}"[:256],
         description=description,
@@ -406,6 +429,224 @@ async def envoyer_rappel(user_id, ev, lien_annonce):
 def retirer_team(ev, user_id):
     for cle in ("presents", "attente"):
         ev[cle] = [p for p in ev.get(cle, []) if p["id"] != user_id]
+
+def peut_gerer(interaction, ev):
+    """L'organisateur de la session ou un admin du serveur."""
+    return str(interaction.user.id) == ev.get("organisateur_id") or interaction.permissions.manage_guild
+
+def memoriser_temp(msg):
+    """MP sans session (annulation…) : effacé 24h après l'envoi, comme les réponses drôles."""
+    if msg is None:
+        return
+    liste = team_events.setdefault(CLE_BLAGUES, [])
+    liste.append([msg.channel.id, msg.id, int(time.time())])
+    del liste[:-500]
+
+async def prevenir_complet(ev, lien_annonce, promus=()):
+    """MP « place libérée » aux promus, et « session complète » à ceux qui ne l'ont pas encore."""
+    deja = set(ev.get("dm_envoyes", []))
+    cibles = [p["id"] for p in ev["presents"] if p["id"] not in deja] if len(ev["presents"]) >= ev.get("places", 8) else []
+    for p in promus:
+        if p["id"] not in cibles:
+            cibles.append(p["id"])
+    if cibles:
+        ev["dm_envoyes"] = sorted(deja | set(cibles))
+        save_team_events()
+    ids_promus = {p["id"] for p in promus}
+    for uid in cibles:
+        await envoyer_dm_complet(uid, ev, lien_annonce, promu=uid in ids_promus)
+
+def liens_session(ev, lien_annonce):
+    return [l for l in (ligne_reservation(ev), ligne_agenda(ev),
+                        f"**[💬 Voir l'organisation sur Discord]({lien_annonce})**" if lien_annonce else "") if l]
+
+# ── Modifier une session (organisateur ou admin) ────────────────────────────
+class ModifierModal(discord.ui.Modal, title="Modifier la session"):
+    def __init__(self, mid, ev):
+        super().__init__(timeout=600)
+        self.mid = mid
+        d = datetime.fromtimestamp(ev["start_ts"], PARIS)
+        self.date = discord.ui.TextInput(label="Date (JJ/MM/AAAA)", default=d.strftime("%d/%m/%Y"), max_length=30)
+        self.heure = discord.ui.TextInput(label="Heure (ex : 22, 22h10, 22:10)", default=d.strftime("%H:%M"), max_length=10)
+        self.nb = discord.ui.TextInput(label="Nombre de sessions de 40 min (1 à 4)", default=str(ev.get("nb_sessions", 1)), max_length=1)
+        self.desc = discord.ui.TextInput(label="Description", default=ev.get("description", "")[:100], max_length=100)
+        self.places = discord.ui.TextInput(label=f"Places (1 à {PLACES_MAX})", default=str(ev.get("places", PLACES_DEFAUT)), max_length=2)
+        for champ in (self.date, self.heure, self.nb, self.desc, self.places):
+            self.add_item(champ)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await appliquer_modif(interaction, self.mid, self.date.value, self.heure.value,
+                              self.nb.value, self.desc.value, self.places.value)
+
+def lien_annonce(ev, mid, interaction):
+    salon = ev.get("channel_id") or getattr(interaction.channel, "id", 0)
+    return f"https://discord.com/channels/{ev.get('guild_id') or interaction.guild_id}/{salon}/{mid}"
+
+async def maj_annonce(ev, mid, salon_menu=None):
+    """Réaffiche l'annonce (le menu ⚙️ est un message privé à part)."""
+    try:
+        salon = (bot.get_channel(ev["channel_id"]) or await bot.fetch_channel(ev["channel_id"])) if ev.get("channel_id") else salon_menu
+        await salon.get_partial_message(int(mid)).edit(embed=build_team_embed(ev), view=TeamView())
+    except Exception as e:
+        print(f"⚠️ Annonce {mid} non mise à jour : {e}")
+
+def quand(ts):
+    return f"<t:{ts}:f>"
+
+async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
+    ev = team_events.get(mid)
+    if not ev:
+        await interaction.response.send_message("Cette session n'existe plus.", ephemeral=True)
+        return
+    erreurs = []
+    try:
+        debut = parse_date_heure(date, heure)
+        if debut < datetime.now(PARIS) - timedelta(hours=1):
+            erreurs.append(f"la date `{date}` à `{heure}` est déjà passée")
+    except ValueError:
+        erreurs.append(f"date `{date}` ou heure `{heure}` incomprise (ex : `14/10/2026` et `22h10`)")
+    n = int(nb) if nb.strip().isdecimal() else 0
+    if not 1 <= n <= 4:
+        erreurs.append("le nombre de sessions doit être entre 1 et 4")
+    pl = int(places) if places.strip().isdecimal() else 0
+    if not 1 <= pl <= PLACES_MAX:
+        erreurs.append(f"le nombre de places doit être entre 1 et {PLACES_MAX}")
+    desc = desc.strip()[:100] or ev.get("description", "Mix chill")
+    if erreurs:
+        await interaction.response.send_message("❌ Rien n'a été modifié : " + " ; ".join(erreurs) + ".", ephemeral=True)
+        return
+
+    nouveau_ts = int(debut.timestamp())
+    changements = []
+    if nouveau_ts != ev["start_ts"]:
+        changements.append(("📅 Quand", quand(ev["start_ts"]), quand(nouveau_ts)))
+    if n != ev.get("nb_sessions", 1):
+        changements.append(("🕙 Sessions", f"{ev.get('nb_sessions', 1)} × {DUREE_SESSION} min", f"{n} × {DUREE_SESSION} min"))
+    if desc != ev.get("description"):
+        changements.append(("📝 Description", discord.utils.escape_markdown(ev.get("description", "—")),
+                            discord.utils.escape_markdown(desc)))
+    if pl != ev.get("places", 8):
+        changements.append(("👥 Places", str(ev.get("places", 8)), str(pl)))
+    if not changements:
+        await interaction.response.send_message("Aucun changement : la session est identique.", ephemeral=True)
+        return
+
+    ev.setdefault("attente", [])
+    if nouveau_ts != ev["start_ts"]:
+        ev["rappel_envoye"] = False
+    ev.update(start_ts=nouveau_ts, nb_sessions=n, description=desc, places=pl,
+              titre=f"{desc} · {debut.strftime('%H:%M')}")
+    # Places réduites : les derniers inscrits passent en tête de la file d'attente
+    retrogrades = ev["presents"][pl:]
+    ev["presents"] = ev["presents"][:pl]
+    ev["attente"] = retrogrades + ev["attente"]
+    # Places en plus : les premiers de la file d'attente sont inscrits
+    promus = ev["attente"][:max(0, pl - len(ev["presents"]))]
+    ev["presents"] += promus
+    ev["attente"] = ev["attente"][len(promus):]
+    ids_retro = {p["id"] for p in retrogrades}
+    ids_promus = {p["id"] for p in promus}
+    if ids_retro:
+        ev["dm_envoyes"] = [u for u in ev.get("dm_envoyes", []) if u not in ids_retro]
+
+    await interaction.response.edit_message(content="✅ Session modifiée : les joueurs sont prévenus en MP.", view=None)
+    save_team_events()
+    await maj_annonce(ev, mid, interaction.channel)
+    lien = lien_annonce(ev, mid, interaction)
+    auteur = interaction.user.display_name
+    nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
+    resume = "\n\n".join(f"**{lab}**\n~~{av}~~ → **{ap}**" for lab, av, ap in changements)
+
+    # Fil de discussion : nouveau nom + message
+    if ev.get("thread_id"):
+        try:
+            fil = bot.get_channel(ev["thread_id"]) or await bot.fetch_channel(ev["thread_id"])
+            await fil.edit(name=f"{desc[:80]} {debut.strftime('%d/%m/%Y %H:%M')}")
+            await fil.send(f"✏️ {interaction.user.mention} a modifié la session :\n\n{resume}")
+        except Exception as e:
+            print(f"⚠️ Fil non mis à jour : {e}")
+
+    # MP aux inscrits et à la file d'attente (sauf l'auteur de la modif)
+    for p in ev["presents"] + ev["attente"]:
+        if p["id"] == str(interaction.user.id):
+            continue
+        if p["id"] in ids_promus:
+            perso = "🎉 **Une place s'est libérée : tu es inscrit !**\n\n"
+        elif p["id"] in ids_retro:
+            pos = next(i for i, x in enumerate(ev["attente"], 1) if x["id"] == p["id"])
+            perso = f"⏳ **Moins de places : tu passes en file d'attente (position {pos}).**\n\n"
+        else:
+            perso = ""
+        embed = discord.Embed(
+            title=f"✏️ {auteur} a modifié {nom} · {desc}"[:256],
+            description=(perso + resume + "\n\n" + "\n\n".join(liens_session(ev, lien)))[:4096],
+            color=0x3498DB
+        )
+        await envoyer_mp(p["id"], embed, ev)
+    save_team_events()
+    await prevenir_complet(ev, lien)
+
+# ── Menu ⚙️ Gérer (visible seulement par l'organisateur / un admin) ─────────
+class GererView(discord.ui.View):
+    def __init__(self, mid):
+        super().__init__(timeout=600)
+        self.mid = mid
+
+    async def _session(self, interaction):
+        ev = team_events.get(self.mid)
+        if not ev:
+            await interaction.response.edit_message(content="Cette session n'existe plus.", view=None)
+            return None
+        return ev
+
+    @discord.ui.button(label="✏️ Modifier", style=discord.ButtonStyle.primary)
+    async def modifier(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ev = await self._session(interaction)
+        if ev:
+            await interaction.response.send_modal(ModifierModal(self.mid, ev))
+
+    @discord.ui.button(label="🗑️ Annuler la session", style=discord.ButtonStyle.danger)
+    async def annuler(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._session(interaction):
+            await interaction.response.edit_message(
+                content="Annuler cette session ? L'annonce et le fil seront supprimés et les joueurs prévenus en MP.",
+                view=ConfirmerAnnulation(self.mid))
+
+# ── Annuler une session (organisateur ou admin) ─────────────────────────────
+class ConfirmerAnnulation(discord.ui.View):
+    def __init__(self, mid):
+        super().__init__(timeout=60)
+        self.mid = mid
+
+    @discord.ui.button(label="Oui, annuler la session", style=discord.ButtonStyle.danger)
+    async def confirmer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ev = team_events.pop(self.mid, None)
+        if not ev:
+            await interaction.response.edit_message(content="Cette session n'existe plus.", view=None)
+            return
+        await interaction.response.edit_message(content="🗑️ Session annulée : les joueurs sont prévenus en MP.", view=None)
+        nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
+        embed = discord.Embed(
+            title=f"❌ {interaction.user.display_name} a annulé {nom} · {ev.get('description', ev['titre'])}"[:256],
+            description=(f"📅 <t:{ev['start_ts']}:F>\n\n"
+                         "La session n'aura pas lieu. Si tu avais réservé, pense à annuler ta réservation EVA "
+                         "et à retirer la partie de ton agenda."),
+            color=0xE74C3C
+        )
+        for canal, message in ev.get("mps", []):
+            await supprimer_mp(canal, message)
+        for p in ev.get("presents", []) + ev.get("attente", []):
+            if p["id"] != str(interaction.user.id):
+                memoriser_temp(await envoyer_mp(p["id"], embed))
+        if ev.get("thread_id"):
+            await supprimer_salon_ou_message(ev["thread_id"])
+        if ev.get("channel_id"):
+            await supprimer_salon_ou_message(ev["channel_id"], int(self.mid))
+        save_team_events()
+
+    @discord.ui.button(label="Non, garder la session", style=discord.ButtonStyle.secondary)
+    async def garder(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="👍 La session est conservée.", view=None)
 
 class TeamView(discord.ui.View):
     def __init__(self):
@@ -449,18 +690,8 @@ class TeamView(discord.ui.View):
         if info:
             await interaction.followup.send(info, ephemeral=True)
 
-        # Session pleine : MP à chaque joueur qui ne l'a pas encore reçu
-        if len(ev["presents"]) >= places:
-            deja_prevenus = set(ev.get("dm_envoyes", []))
-            cibles = [p["id"] for p in ev["presents"] if p["id"] not in deja_prevenus]
-            if promu and promu["id"] not in cibles:
-                cibles.append(promu["id"])
-            if cibles:
-                ev["dm_envoyes"] = sorted(deja_prevenus | set(cibles))
-                save_team_events()
-            for uid in cibles:
-                await envoyer_dm_complet(uid, ev, interaction.message.jump_url,
-                                         promu=bool(promu and uid == promu["id"]))
+        # MP « place libérée » / « session complète »
+        await prevenir_complet(ev, interaction.message.jump_url, [promu] if promu else [])
 
     @discord.ui.button(label="✅ Présent", style=discord.ButtonStyle.success, custom_id="team_present")
     async def present(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -473,6 +704,17 @@ class TeamView(discord.ui.View):
     @discord.ui.button(label="⏳ File d'attente", style=discord.ButtonStyle.primary, custom_id="team_attente")
     async def attente(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._repondre(interaction, "attente")
+
+    @discord.ui.button(label="⚙️ Gérer", style=discord.ButtonStyle.secondary, custom_id="team_gerer")
+    async def gerer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mid = str(interaction.message.id)
+        ev = team_events.get(mid)
+        if not ev:
+            await interaction.response.send_message("Cette session n'existe plus.", ephemeral=True)
+        elif not peut_gerer(interaction, ev):
+            await interaction.response.send_message("⛔ Seul l'organisateur (ou un admin) peut gérer cette session.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚙️ Que veux-tu faire ?", view=GererView(mid), ephemeral=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Commande /orga
@@ -606,7 +848,7 @@ def lire_location_id(lien):
     """Trouve l'identifiant de la salle (locationId) dans un lien de réservation EVA.
     Accepte aussi directement le numéro (ex : 52)."""
     lien = lien.strip()
-    if lien.isdigit():
+    if lien.isdecimal():
         n = int(lien)
     else:
         m = re.search(r"locationid(?:=|%3d)(\d+)", lien, re.IGNORECASE)
@@ -818,7 +1060,7 @@ async def on_message(message):
         DEJA_AIDE[uid] = aujourd_hui  # l'aide revient au 1er MP de chaque journée
         texte += f"\n\n{aide_mp()}"
     try:
-        envoye = await message.channel.send(texte)
+        envoye = await message.channel.send(texte, view=VueMP())
         blagues = team_events.setdefault(CLE_BLAGUES, [])
         blagues.append([envoye.channel.id, envoye.id, int(time.time())])
         del blagues[:-500]   # garde-fou : jamais plus de 500 en mémoire
@@ -840,6 +1082,7 @@ async def on_ready():
 
     await tree.sync()
     bot.add_view(TeamView())
+    bot.add_view(VueMP())
     if not nettoyage_j1.is_running():
         nettoyage_j1.start()
     if not rappels_1h.is_running():
