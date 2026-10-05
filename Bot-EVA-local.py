@@ -24,7 +24,7 @@ PLACES_MAX = 10                         # capacité max de l'arène
 MAX_PAR_JOUR = 50                       # sessions créées par jour (anti-spam)
 MAX_PAR_MOIS = 1500                     # sessions créées par mois (reste dans le gratuit Google)
 PLACES_DEFAUT = 8                       # places par défaut dans /orga (modifiable à chaque fois)
-DESCRIPTIONS_DEFAUT = ["Mix chill", "Train", "Split"]
+DESCRIPTIONS_DEFAUT = ["Mix Chill", "Train", "Split"]
 # Le nom de la salle, son téléphone et son identifiant EVA se règlent
 # directement sur Discord avec /config (réservé aux admins du serveur).
 
@@ -500,7 +500,7 @@ class SessionModal(discord.ui.Modal):
             ("📅 Date", None, self.date),
             ("🕙 Heure de début", None, self.heure),
             ("🎮 Sessions", None, self.nb),
-            ("📝 Description", ", ".join(presets)[:84] + "… ou ton texte", self.desc),
+            ("📝 Description", "ex : " + ", ".join(presets)[:80] + "… ou ton texte", self.desc),
             ("👥 Places", f"{PLACES_MAX} max", self.places),
         ):
             self.add_item(discord.ui.Label(text=texte, description=aide, component=champ))
@@ -547,7 +547,7 @@ async def appliquer_modif(interaction, mid, date, heure, nb, desc, places):
     pl = int(places) if places.strip().isdecimal() else 0
     if not 1 <= pl <= PLACES_MAX:
         erreurs.append(f"le nombre de places doit être entre 1 et {PLACES_MAX}")
-    desc = desc.strip()[:100] or ev.get("description", "Mix chill")
+    desc = desc.strip()[:100] or ev.get("description", "Mix Chill")
     if erreurs:
         await interaction.response.send_message("❌ Rien n'a été modifié : " + " ; ".join(erreurs) + ".", ephemeral=True)
         return
@@ -801,7 +801,7 @@ async def creer_session(interaction, date, heure, nb, description, places):
         await interaction.response.send_message("❌ Session non créée : " + " ; ".join(erreurs) + ".", ephemeral=True)
         return
 
-    desc = description.strip()[:100] or "Mix chill"
+    desc = description.strip()[:100] or "Mix Chill"
     ev = {
         "titre": f"{desc} · {debut.strftime('%H:%M')}",
         "organisateur_id": str(interaction.user.id),
@@ -852,7 +852,7 @@ def lire_location_id(lien):
     nom_salle="Nom de la salle (ex : EVA Lyon Sud)",
     telephone="Numéro de la salle (ex : 04 85 96 05 10)",
     lien="Colle un lien de réservation EVA de la salle (ou juste son numéro, ex : 52)",
-    descriptions="Descriptions proposées, séparées par des virgules (défaut : Mix chill, Train, Split)",
+    descriptions="Descriptions proposées, séparées par des virgules (défaut : Mix Chill, Train, Split)",
 )
 async def config_cmd(
     interaction: discord.Interaction,
