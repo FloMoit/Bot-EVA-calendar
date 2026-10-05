@@ -11,6 +11,7 @@ import base64
 import threading
 import time
 import requests
+from urllib.parse import urlencode
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -144,7 +145,8 @@ def save_team_events():
             json.dump(team_events, f, ensure_ascii=False)
 
 team_events = load_team_events()
-CLE_STATS = "_compteurs"   # rangé avec les sessions, mais ce n'est pas une session
+CLE_STATS = "_compteurs"
+CLE_BLAGUES = "_mp_blagues"   # réponses drôles envoyées en MP (effacées après 24h)   # rangé avec les sessions, mais ce n'est pas une session
 
 def sessions():
     """Toutes les sessions (sans les compteurs)."""
@@ -194,12 +196,27 @@ def horaires_sessions(ev):
     d = ev.get("duree", DUREE_SESSION)
     return " · ".join(f"<t:{ts + i * d * 60}:t>" for i in range(n))
 
-async def envoyer_mp(user_id, embed):
+async def envoyer_mp(user_id, embed, ev=None):
+    """Envoie un MP ; si une session est donnée, le retient pour l'effacer à J+1."""
     try:
         user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
-        await user.send(embed=embed)
+        msg = await user.send(embed=embed)
     except discord.HTTPException as e:
         print(f"⚠️ MP impossible à {user_id} (MP fermés ?) : {e}")
+        return None
+    try:
+        if ev is not None:
+            ev.setdefault("mps", []).append([msg.channel.id, msg.id])
+    except Exception as e:
+        print(f"⚠️ MP envoyé mais non mémorisé ({user_id}) : {e}")
+    return msg
+
+async def supprimer_mp(channel_id, message_id):
+    """Efface un MP envoyé par le bot (sans erreur s'il a déjà disparu)."""
+    try:
+        await bot.get_partial_messageable(int(channel_id)).get_partial_message(int(message_id)).delete()
+    except discord.HTTPException:
+        pass
 
 async def creer_fil(msg, nom):
     """Crée un fil de discussion sous l'annonce. Renvoie l'id du fil ou None."""
@@ -284,6 +301,35 @@ def ligne_reservation(ev):
         return ""
     return f"**[👉 Clique ici pour réserver ta session]({lien_reservation(ev['start_ts'], cfg['location_id'])})**"
 
+def lien_google_agenda(ev):
+    """Lien qui ouvre Google Agenda avec l'événement déjà rempli."""
+    cfg = config_de(ev.get("guild_id")) or {}
+    nom = cfg.get("nom", "EVA")
+    debut = ev["start_ts"]
+    fin = debut + ev.get("nb_sessions", 1) * ev.get("duree", DUREE_SESSION) * 60
+    fmt = lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    n = ev.get("nb_sessions", 1)
+    heures = " · ".join(datetime.fromtimestamp(debut + i * ev.get("duree", DUREE_SESSION) * 60, PARIS).strftime("%H:%M")
+                        for i in range(n))
+    joueurs = ", ".join(p["pseudo"] for p in ev.get("presents", []))
+    details = [f"{n} session{'s' if n > 1 else ''} de {ev.get('duree', DUREE_SESSION)} min : {heures}",
+               f"Joueurs ({len(ev.get('presents', []))}/{ev.get('places', 8)}) : {joueurs or '—'}"]
+    if cfg.get("location_id"):
+        details.append(f"Réserver : {lien_reservation(debut, cfg['location_id'])}")
+    if cfg.get("telephone"):
+        details.append(f"Un retard ? {cfg['telephone']}")
+    params = {
+        "action": "TEMPLATE",
+        "text": f"{nom} · {ev.get('description', ev['titre'])[:100]}",
+        "dates": f"{fmt(debut)}/{fmt(fin)}",
+        "details": "\n".join(details),
+        "location": nom,
+    }
+    return "https://calendar.google.com/calendar/render?" + urlencode(params)
+
+def ligne_agenda(ev):
+    return f"**[📅 Ajouter à mon Google Agenda]({lien_google_agenda(ev)})**"
+
 def build_team_embed(ev):
     ts = ev["start_ts"]
     n = ev.get("nb_sessions", 1)
@@ -298,7 +344,7 @@ def build_team_embed(ev):
             f"{bloc_desc}"
             f"**Quand**\n<t:{ts}:F> · <t:{ts}:R>\n\n"
             f"**Sessions ({n} × {d}min)**\n{horaires_sessions(ev)}\n\n"
-            f"{ligne_reservation(ev)}"
+            f"{ligne_reservation(ev)}\n{ligne_agenda(ev)}"
         ).strip(),
         color=0x2ECC71
     )
@@ -319,21 +365,24 @@ def build_team_embed(ev):
 
 async def envoyer_dm_complet(user_id, ev, lien_annonce, promu=False):
     ts = ev["start_ts"]
-    joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
+    n = ev.get("nb_sessions", 1)
     nom = (config_de(ev.get("guild_id")) or {}).get("nom", "EVA")
-    titre = (f"🎉 Une place s'est libérée à {nom}, tu es inscrit : {ev['titre']}" if promu
-             else f"✅ Session complète pour {nom} : {ev['titre']}")
+    joueurs = "\n".join(f"{i}. {p['pseudo']}" for i, p in enumerate(ev["presents"], 1))
+    titre = "🎉 Une place s'est libérée, tu es inscrit !" if promu else "✅ Session complète !"
+    liens = [l for l in (ligne_reservation(ev), ligne_agenda(ev),
+                         f"**[💬 Voir la partie sur Discord]({lien_annonce})**") if l]
     embed = discord.Embed(
-        title=titre[:256],
+        title=titre,
         description=(
-            f"📅 <t:{ts}:F>\n\n"
-            f"**Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
-            f"{ligne_reservation(ev)}\n\n"
-            f"**[💬 Voir l'organisation de la partie sur Discord]({lien_annonce})**"
+            f"**{nom}** · {ev.get('description', ev['titre'])}\n\n"
+            f"📅 **Quand**\n<t:{ts}:F>\n\n"
+            f"🕙 **Sessions**\n{horaires_sessions(ev)} ({n} × {ev.get('duree', DUREE_SESSION)} min)\n\n"
+            f"👥 **Joueurs ({len(ev['presents'])}/{ev.get('places', 8)})**\n{joueurs}\n\n"
+            + "\n".join(liens)
         )[:4096],
         color=0x2ECC71
     )
-    await envoyer_mp(user_id, embed)
+    await envoyer_mp(user_id, embed, ev)
 
 async def envoyer_rappel(user_id, ev, lien_annonce):
     n = ev.get("nb_sessions", 1)
@@ -349,7 +398,7 @@ async def envoyer_rappel(user_id, ev, lien_annonce):
         description=description,
         color=0xF1C40F
     )
-    await envoyer_mp(user_id, embed)
+    await envoyer_mp(user_id, embed, ev)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Boutons : Présent / Sortir / File d'attente
@@ -687,6 +736,8 @@ async def nettoyage_j1():
             a_supprimer.append(mid)
     for mid in a_supprimer:
         ev = team_events.pop(mid, {})
+        for canal, message in ev.get("mps", []):
+            await supprimer_mp(canal, message)
         try:
             if ev.get("thread_id"):
                 await supprimer_salon_ou_message(ev["thread_id"])
@@ -694,8 +745,16 @@ async def nettoyage_j1():
                 await supprimer_salon_ou_message(ev["channel_id"], int(mid))
         except Exception as e:
             print(f"⚠️ Nettoyage session {mid} : {e}")
-    if a_supprimer:
-        print(f"🧹 {len(a_supprimer)} session(s) supprimée(s) (J+1)")
+    # Réponses drôles en MP : effacées 24h après leur envoi
+    blagues = team_events.get(CLE_BLAGUES, [])
+    vieilles = [b for b in blagues if maintenant - b[2] > 24 * 3600]
+    for canal, message, _ in vieilles:
+        await supprimer_mp(canal, message)
+    if vieilles:
+        team_events[CLE_BLAGUES] = [b for b in blagues if maintenant - b[2] <= 24 * 3600]
+    if a_supprimer or vieilles:
+        if a_supprimer:
+            print(f"🧹 {len(a_supprimer)} session(s) supprimée(s) (J+1)")
         save_team_events()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -759,7 +818,11 @@ async def on_message(message):
         DEJA_AIDE[uid] = aujourd_hui  # l'aide revient au 1er MP de chaque journée
         texte += f"\n\n{aide_mp()}"
     try:
-        await message.channel.send(texte)
+        envoye = await message.channel.send(texte)
+        blagues = team_events.setdefault(CLE_BLAGUES, [])
+        blagues.append([envoye.channel.id, envoye.id, int(time.time())])
+        del blagues[:-500]   # garde-fou : jamais plus de 500 en mémoire
+        save_team_events()
     except discord.HTTPException:
         pass
 
