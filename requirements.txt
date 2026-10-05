@@ -1,2 +1,2 @@
-discord.py>=2.3,<3
+discord.py>=2.6,<3
 requests>=2.31
